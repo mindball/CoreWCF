@@ -20,8 +20,17 @@ using Xunit;
 
 namespace CoreWCF.WebHttp.Tests
 {
+    internal static class Extension
+    {
+        public static string GetFullNameSpace(this Type classReference)
+        {
+           return $"{classReference?.Namespace}.{classReference?.Name}";
+        }
+    }
+
     public partial class OpenApiWcfTests
     {
+        
         [Fact]
         public void SetsOpenApiVersion()
         {
@@ -368,6 +377,9 @@ namespace CoreWCF.WebHttp.Tests
         [DataContract(Name = "SimpleResponse")]
         private class SimpleResponse { }
 
+        [DataContract()]
+        private class SimpleResponseNoDCName { }
+
         private interface IDefaultResponseContentTypeFallthrough
         {
             [WebGet(UriTemplate = "/attribute", ResponseFormat = WebMessageFormat.Json)]
@@ -375,6 +387,12 @@ namespace CoreWCF.WebHttp.Tests
 
             [WebGet(UriTemplate = "/behavior")]
             public SimpleResponse FromBehavior();
+
+            [WebGet(UriTemplate = "/attribute", ResponseFormat = WebMessageFormat.Json)]
+            public SimpleResponseNoDCName FromAttributeV2();
+
+            [WebGet(UriTemplate = "/behavior")]
+            public SimpleResponseNoDCName FromBehaviorV2();
         }
 
         [Fact]
@@ -725,13 +743,22 @@ namespace CoreWCF.WebHttp.Tests
         [DataContract(Name = "SimpleRequest")]
         internal class SimpleRequest { }
 
+        [DataContract()]
+        internal class SimpleRequestNoDCName { }
+
         private interface IRequestBodyContentTypeFallthrough
         {
             [WebInvoke(Method = "POST", UriTemplate = "/attribute", RequestFormat = WebMessageFormat.Json)]
             public void FromAttribute(SimpleRequest request);
 
             [WebInvoke(Method = "POST", UriTemplate = "/default")]
-            public void Default(SimpleRequest request);
+            public void Default(SimpleRequestNoDCName request);
+
+            [WebInvoke(Method = "POST", UriTemplate = "/attribute", RequestFormat = WebMessageFormat.Json)]
+            public void FromAttributeV2(SimpleRequestNoDCName request);
+
+            [WebInvoke(Method = "POST", UriTemplate = "/default")]
+            public void DefaultV2(SimpleRequestNoDCName request);
         }
 
         [Fact]
@@ -839,24 +866,37 @@ namespace CoreWCF.WebHttp.Tests
         [DataContract(Name = "SimpleSchema")]
         private class SimpleSchema { }
 
+        [DataContract]
+        private class SimpleSchema_DataContractNameNotDefined { }
+
         private interface ISchemaOnlyAddedOnce
         {
             [WebInvoke(Method = "POST", UriTemplate = "/one")]
-            void One([OpenApiParameter(ContentTypes = new[] { "application/json" })] SimpleSchema body);
+            void One([OpenApiParameter(ContentTypes = new[] {"application/json"})] SimpleSchema body);
 
             [WebInvoke(Method = "POST", UriTemplate = "/two")]
-            void Two([OpenApiParameter(ContentTypes = new[] { "application/json" })] SimpleSchema body);
+            void Two([OpenApiParameter(ContentTypes = new[] {"application/json"})] SimpleSchema body);
+
+            [WebInvoke(Method = "POST", UriTemplate = "/one")]
+            void OneV2(
+                [OpenApiParameter(ContentTypes = new[] {"application/json"})]
+                SimpleSchema_DataContractNameNotDefined body);
         }
 
         [Fact]
         public void SchemaOnlyAddedOnce()
         {
             JsonElement json = GetJson(new OpenApiOptions(), new List<Type> { typeof(ISchemaOnlyAddedOnce) });
-
+            
             json
                 .GetProperty("components")
                 .GetProperty("schemas")
                 .GetProperty("SimpleSchema");
+
+            json
+                .GetProperty("components")
+                .GetProperty("schemas")
+                .GetProperty(typeof(SimpleSchema_DataContractNameNotDefined).GetFullNameSpace());
         }
 
         [DataContract(Name = "CircularSchemaOne")]
@@ -865,6 +905,8 @@ namespace CoreWCF.WebHttp.Tests
             public CircularSchemaOne One { get; set; }
 
             public CircularSchemaTwo Two { get; set; }
+
+            public CircularSchemaThreeNoDCName Three { get; set; }
         }
 
         [DataContract(Name = "CircularSchemaTwo")]
@@ -873,6 +915,18 @@ namespace CoreWCF.WebHttp.Tests
             public CircularSchemaOne One { get; set; }
 
             public CircularSchemaTwo Two { get; set; }
+
+            public CircularSchemaThreeNoDCName Three { get; set; }
+        }
+
+        [DataContract()]
+        private class CircularSchemaThreeNoDCName
+        {
+            public CircularSchemaOne One { get; set; }
+        
+            public CircularSchemaTwo Two { get; set; }
+            
+            public CircularSchemaThreeNoDCName Three { get; set; }
         }
 
         private interface ICircularSchemaWorks
@@ -882,6 +936,9 @@ namespace CoreWCF.WebHttp.Tests
 
             [WebInvoke(Method = "POST", UriTemplate = "/two")]
             void Two([OpenApiParameter(ContentTypes = new[] { "application/json" })] CircularSchemaTwo body);
+
+            [WebInvoke(Method = "POST", UriTemplate = "/three")]
+            void Three([OpenApiParameter(ContentTypes = new[] { "application/json" })] CircularSchemaThreeNoDCName body);
         }
 
         [Fact]
@@ -898,6 +955,11 @@ namespace CoreWCF.WebHttp.Tests
                 .GetProperty("components")
                 .GetProperty("schemas")
                 .GetProperty("CircularSchemaTwo");
+
+            json
+                .GetProperty("components")
+                .GetProperty("schemas")
+                .GetProperty(typeof(CircularSchemaThreeNoDCName).GetFullNameSpace());
         }
 
         [DataContract(Name = "NestedClassOne")]
@@ -915,7 +977,14 @@ namespace CoreWCF.WebHttp.Tests
         }
 
         [DataContract(Name = "NestedClassThree")]
-        private class NestedClassThree { }
+        private class NestedClassThree
+        {
+            [DataMember]
+            public NestedClassFour Four { get; set; }
+        }
+
+        [DataContract]
+        private class NestedClassFour { }
 
         private interface INestedTypesAddedToSchemas
         {
@@ -946,13 +1015,25 @@ namespace CoreWCF.WebHttp.Tests
                 .GetProperty("$ref")
                 .GetString();
 
+            string referenceThree = json
+                .GetProperty("components")
+                .GetProperty("schemas")
+                .GetProperty("NestedClassTwo-NestedClassThree")
+                .GetProperty("properties")
+                .GetProperty(typeof(NestedClassFour).GetFullNameSpace())
+                .GetProperty("$ref")
+                .GetString();
+
             json
                 .GetProperty("components")
                 .GetProperty("schemas")
                 .GetProperty("NestedClassTwo-NestedClassThree");
 
+            
+
             Assert.Equal("#/components/schemas/NestedClassOne-NestedClassTwo", referenceOne);
             Assert.Equal("#/components/schemas/NestedClassTwo-NestedClassThree", referenceTwo);
+            Assert.Equal("#/components/schemas/NestedClassThree-NestedClassFour", referenceTwo);
         }
 
         [DataContract(Name = "CollectionClass")]
@@ -1343,6 +1424,7 @@ namespace CoreWCF.WebHttp.Tests
             Assert.Equal("Property", property.GetString());
             Assert.Equal("array", type);
             Assert.Equal("#/components/schemas/ComplexCollectionPropertyClass-Array-InnerComplexCollectionPropertyClass", itemType);
+            // Assert.Equal("#/components/schemas/items/InnerComplexCollectionPropertyClass", itemType);
             Assert.Equal("description", description);
         }
 

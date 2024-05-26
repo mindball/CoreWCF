@@ -1,7 +1,4 @@
-﻿// Licensed to the .NET Foundation under one or more agreements.
-// The .NET Foundation licenses this file to you under the MIT license.
-
-using System;
+﻿using System;
 using System.Collections.Generic;
 using Microsoft.OpenApi.Models;
 
@@ -76,5 +73,10 @@ namespace CoreWCF.OpenApi
         /// Optional callback to sort tags.
         /// </summary>
         public IComparer<OpenApiTag> TagsSorter { get; set; }
+
+        /// <summary>
+        /// Additional custom mappings for types.
+        /// </summary>
+        public IReadOnlyDictionary<Type, Func<OpenApiSchema>> CustomTypeMappings { get; set; } = new Dictionary<Type, Func<OpenApiSchema>>();
     }
 }

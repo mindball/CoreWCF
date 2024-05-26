@@ -4,6 +4,7 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -23,6 +24,18 @@ using Microsoft.OpenApi.Models;
 
 namespace CoreWCF.OpenApi
 {
+    public enum TypeKind
+    {
+        None = 0,
+        UnderlyingType = 1,
+        ArrayType = 2,
+        EnumerableType = 4,
+        InterfaceType = 8,
+        EnumType = 16,
+        PrimitiveType = 32,
+        DateTimeType = 64
+    }
+
     /// <summary>
     /// This class builds an OpenAPI specification file out of attributes applied to WCF service interfaces.
     /// </summary>
@@ -57,7 +70,7 @@ namespace CoreWCF.OpenApi
             };
 
             PopulateOpenApiInfo(document, info);
-            PopulateOpenApiPathsOperations(document, contracts, info.TagsToHide);
+            PopulateOpenApiPathsOperations(document, contracts.ToList(), info.TagsToHide.ToList(), info.CustomTypeMappings);
 
             if (info.TagsSorter != null)
             {
@@ -119,20 +132,21 @@ namespace CoreWCF.OpenApi
         /// <param name="document">The document object that is being built up.</param>
         /// <param name="contracts">The WCF contracts that should be documented.</param>
         /// <param name="tagsToHide">Any tags that need to be hidden for some reason.</param>
-        private static void PopulateOpenApiPathsOperations(OpenApiDocument document, IEnumerable<OpenApiContractInfo> contracts, IEnumerable<string> tagsToHide)
+        private static void PopulateOpenApiPathsOperations(OpenApiDocument document, List<OpenApiContractInfo> contracts,
+            List<string> tagsToHide, IReadOnlyDictionary<Type, Func<OpenApiSchema>> customTypeMappings)
         {
-            foreach (OpenApiContractInfo contractInfo in contracts)
+            foreach (var contractInfo in contracts)
             {
-                List<MethodInfo> methods = new List<MethodInfo>();
-                foreach (Type interfaceInfo in contractInfo.Contract.GetInterfaces())
-                {
+                var methods = new List<MethodInfo>();
+                foreach (var interfaceInfo in contractInfo.Contract.GetInterfaces())
                     methods.AddRange(interfaceInfo.GetMethods());
-                }
+
                 methods.AddRange(contractInfo.Contract.GetMethods());
 
-                OpenApiBasePathAttribute basePathAttribute = contractInfo.Contract.GetCustomAttribute<OpenApiBasePathAttribute>();
+                var basePathAttribute =
+                    contractInfo.Contract.GetCustomAttribute<OpenApiBasePathAttribute>();
 
-                foreach (MethodInfo method in methods)
+                foreach (var method in methods)
                 {
                     PopulateOpenApiPath(
                         document,
@@ -140,7 +154,8 @@ namespace CoreWCF.OpenApi
                         tagsToHide,
                         basePathAttribute?.BasePath,
                         contractInfo.ResponseFormat,
-                        GetMethodUriWebGet);
+                        GetMethodUriWebGet,
+                        customTypeMappings);
 
                     PopulateOpenApiPath(
                         document,
@@ -148,7 +163,8 @@ namespace CoreWCF.OpenApi
                         tagsToHide,
                         basePathAttribute?.BasePath,
                         contractInfo.ResponseFormat,
-                        GetMethodUriWebInvoke);
+                        GetMethodUriWebInvoke,
+                        customTypeMappings);
                 }
             }
         }
@@ -162,13 +178,13 @@ namespace CoreWCF.OpenApi
         /// <param name="additionalBasePath">An additional base path a given service contract is registered under.</param>
         /// <param name="behaviorFormat">The default format in the WebHttpBehavior.</param>
         /// <param name="getOperationInfo">Get necessary information about an operation.</param>
-        private static void PopulateOpenApiPath(
-            OpenApiDocument document,
+        private static void PopulateOpenApiPath(OpenApiDocument document,
             MethodInfo methodInfo,
-            IEnumerable<string> tagsToHide,
+            List<string> tagsToHide,
             string additionalBasePath,
             WebMessageFormat behaviorFormat,
-            Func<MethodInfo, OperationInfo> getOperationInfo)
+            Func<MethodInfo, OperationInfo> getOperationInfo,
+            IReadOnlyDictionary<Type, Func<OpenApiSchema>> customTypeMappings)
         {
             OperationInfo operationInfo = getOperationInfo(methodInfo);
             if (operationInfo.Method == null || operationInfo.UriTemplate == null)
@@ -202,14 +218,17 @@ namespace CoreWCF.OpenApi
             {
                 ResponseFormatExplicitlySet = operationInfo.IsResponseFormatSetExplicitly,
                 ResponseAttributeFormat = operationInfo.ResponseFormat,
-                ResponseBehaviorFormat = behaviorFormat
+                ResponseBehaviorFormat = behaviorFormat,
+                //TODO These properties are likely used later in the code to determine how to format the request of an operation.
+                RequestFormatExplicitlySet = operationInfo.IsRequestFormatSetExplicitly,
+                RequestAttributeFormat = operationInfo.RequestFormat
             };
 
             NameTable table = new NameTable();
             XmlNamespaceManager nsManager = new XmlNamespaceManager(table);
 
-            PopulateOpenApiResponses(document, operation, methodInfo, defaultContentType, tagsToHide, nsManager);
-            PopulateOpenApiParameters(document, operation, methodInfo, operationInfo.UriTemplate, defaultContentType, tagsToHide, nsManager);
+            PopulateAllOpenApiResponses(document, operation, methodInfo, defaultContentType, tagsToHide, nsManager, customTypeMappings);
+            PopulateOpenApiParameters(document, operation, methodInfo, operationInfo.UriTemplate, defaultContentType, tagsToHide, nsManager, customTypeMappings);
             PopulateOpenApiOperationTags(document, operation, methodInfo);
             PopulateOpenApiOperationSummary(operation, methodInfo);
 
@@ -323,30 +342,33 @@ namespace CoreWCF.OpenApi
         /// <param name="method">The given method.</param>
         /// <param name="defaultContentType">Calculates the default content type.</param>
         /// <param name="tagsToHide">Any tags that need to be hidden for some reason.</param>
-        private static void PopulateOpenApiResponses(
+        private static void PopulateAllOpenApiResponses(
             OpenApiDocument document,
             OpenApiOperation operation,
             MethodInfo method,
             DefaultContentType defaultContentType,
-            IEnumerable<string> tagsToHide,
-            XmlNamespaceManager nsManager)
+            List<string> tagsToHide,
+            XmlNamespaceManager nsManager,
+            IReadOnlyDictionary<Type, Func<OpenApiSchema>> customTypeMappings)
         {
-            IEnumerable<OpenApiResponseAttribute> attributes = method.GetCustomAttributes<OpenApiResponseAttribute>();
+            var attributes = method.GetCustomAttributes<OpenApiResponseAttribute>().ToList();
             if (attributes.Any())
             {
                 foreach (OpenApiResponseAttribute responseAttribute in method.GetCustomAttributes<OpenApiResponseAttribute>())
                 {
-                    PopulateOpenApiResponse(
+                    PopulateIndividualOpenApiResponse(
                         responseAttribute.Type,
                         document,
                         operation,
                         defaultContentType,
                         tagsToHide,
                         nsManager,
+                        customTypeMappings,
                         responseAttribute);
                 }
             }
-            else if (method.ReturnType != null && method.ReturnType != typeof(Task))
+            //TODO method.ReturnType != null always return true even 'void' 
+            else if (method.ReturnType != typeof(Task))
             {
                 Type type = method.ReturnType;
                 if (type.IsGenericType && type.GetGenericTypeDefinition() == typeof(Task<>))
@@ -354,13 +376,20 @@ namespace CoreWCF.OpenApi
                     type = type.GetGenericArguments()[0];
                 }
 
-                PopulateOpenApiResponse(
+                //create condition when method type is void
+                if (type == typeof(void))
+                {
+                    return;
+                }
+
+                PopulateIndividualOpenApiResponse(
                     type,
                     document,
                     operation,
                     defaultContentType,
                     tagsToHide,
-                    nsManager);
+                    nsManager,
+                    customTypeMappings);
             }
         }
 
@@ -374,43 +403,49 @@ namespace CoreWCF.OpenApi
         /// <param name="tagsToHide">Any tags that need to be hidden for some reason.</param>
         /// <param name="nsManager">XmlNamespaceManager instance.</param>
         /// <param name="responseAttribute">Open API metadata for a response.</param>
-        private static void PopulateOpenApiResponse(
+        private static void PopulateIndividualOpenApiResponse(
             Type type,
             OpenApiDocument document,
             OpenApiOperation operation,
             DefaultContentType defaultContentType,
-            IEnumerable<string> tagsToHide,
+            List<string> tagsToHide,
             XmlNamespaceManager nsManager,
+            IReadOnlyDictionary<Type, Func<OpenApiSchema>> customTypeMappings,
             OpenApiResponseAttribute responseAttribute = null)
         {
-            DataContractAttribute dataContractAttribute = type?.GetCustomAttribute<DataContractAttribute>();
+            
             OpenApiSchema schemaSchema;
 
             if (type == null)
             {
                 schemaSchema = null;
             }
-            else if (!string.IsNullOrEmpty(dataContractAttribute?.Name))
-            {
-                PopulateOpenApiSchema(document, type, tagsToHide, nsManager);
-
-                schemaSchema = new OpenApiSchema
-                {
-                    Reference = new OpenApiReference
-                    {
-                        Type = ReferenceType.Schema,
-                        Id = dataContractAttribute.Name
-                    }
-                };
-            }
             else
             {
-                schemaSchema = new OpenApiSchema
+                var dataContractAttribute = type.GetCustomAttribute<DataContractAttribute>();
+                //TODO The starting point of changing, using only the DataContractAttribute name and namespace properties, is as follows:
+                if (dataContractAttribute != null)
                 {
-                    Type = GetType(type)
-                };
+                    PopulateOpenApiSchema(document, type, tagsToHide, nsManager, customTypeMappings);
+                    var schemaId = GetSchemaId(type, dataContractAttribute, null);
+                    schemaSchema = GetOpenApiSchema(type, schemaId);
+                }
+                else if (TryGetDataContractAttribute(type, out var elementType))
+                {
+                    PopulateOpenApiSchema(document, type, tagsToHide, nsManager, customTypeMappings);
+                    var schemaId = GetSchemaId(type, null, elementType);
+                    schemaSchema = GetOpenApiSchema(type, schemaId);
+                }
+                else
+                {
+                    schemaSchema = new OpenApiSchema
+                    {
+                        Type = GetJSONSchemaType(type),
+                        Format = GetFormatType(type)
+                    };
+                }
             }
-
+            
             OpenApiResponse response = new OpenApiResponse
             {
                 Description = responseAttribute?.Description
@@ -431,6 +466,78 @@ namespace CoreWCF.OpenApi
         }
 
         /// <summary>
+        ///     Tries to get the <see cref="DataContractAttribute" /> for the specified <paramref name="type" /> and returns the
+        ///     element type if it exists.
+        /// </summary>
+        /// <param name="type">The type to inspect for the DataContractAttribute.</param>
+        /// <param name="elementType">
+        ///     When this method returns, contains the element type if the DataContractAttribute is found;
+        ///     otherwise, null. This parameter is passed uninitialized.
+        /// </param>
+        /// <returns>true if the DataContractAttribute is found; otherwise, false.</returns>
+        private static bool TryGetDataContractAttribute(Type type, out Type elementType)
+        {
+            elementType = null;
+            //TODO check other cases (return method type is Interface or Enums or ...)
+            if (!typeof(IEnumerable).IsAssignableFrom(type) || type == typeof(string)) return false;
+            if (type.IsGenericType)
+            {
+                elementType = type.GetGenericArguments()[0];
+                return elementType.GetCustomAttribute<DataContractAttribute>() != null;
+            }
+
+            elementType = type.GetElementType();
+            return elementType?.GetCustomAttribute<DataContractAttribute>() != null;
+        }
+
+        /// <summary>
+        ///     Generates a unique identifier for the schema based on the provided type, data contract attribute, and element type.
+        /// </summary>
+        /// <param name="type">The type for which the schema ID is being generated.</param>
+        /// <param name="dataContractAttribute">The data contract attribute associated with the type.</param>
+        /// <param name="elementType">The element type associated with the type, if any.</param>
+        /// <returns>A string representing the unique schema ID.</returns>
+        private static string GetSchemaId(Type type, DataContractAttribute dataContractAttribute, Type elementType)
+        {
+            if (dataContractAttribute?.Name != null) return dataContractAttribute.Name;
+
+            if (elementType != null) return $"{elementType.Namespace}.{elementType.Name}";
+
+            return type.IsArray ? $"{type.Namespace}.{type.GetElementType()?.Name}" : $"{type.Namespace}.{type.Name}";
+        }
+
+        /// <summary>
+        ///     Generates an OpenApiSchema for a given type and schema ID.
+        /// </summary>
+        /// <param name="type">The type for which the OpenApiSchema is to be generated.</param>
+        /// <param name="schemaId">The ID of the schema.</param>
+        /// <returns>An OpenApiSchema object that represents the given type and schema ID.</returns>
+        private static OpenApiSchema GetOpenApiSchema(Type type, string schemaId)
+        {
+            return type.IsArray || (type.IsGenericType && type.GetGenericTypeDefinition() == typeof(List<>))
+                ? new OpenApiSchema
+                {
+                    Type = GetJSONSchemaType(type),
+                    Items = new OpenApiSchema
+                    {
+                        Reference = new OpenApiReference
+                        {
+                            Type = ReferenceType.Schema,
+                            Id = schemaId
+                        }
+                    }
+                }
+                : new OpenApiSchema
+                {
+                    Reference = new OpenApiReference
+                    {
+                        Type = ReferenceType.Schema,
+                        Id = schemaId
+                    }
+                };
+        }
+
+        /// <summary>
         /// Populate the parameters for a given method.
         /// </summary>
         /// <param name="document">The document object that is being built up.</param>
@@ -446,73 +553,101 @@ namespace CoreWCF.OpenApi
             MethodInfo method,
             string uriTemplateRaw,
             DefaultContentType defaultContentType,
-            IEnumerable<string> tagsToHide,
-            XmlNamespaceManager nsManager)
+            List<string> tagsToHide,
+            XmlNamespaceManager nsManager,
+            IReadOnlyDictionary<Type, Func<OpenApiSchema>> customTypeMappings)
         {
-            foreach (ParameterInfo parameter in method.GetParameters())
+            //TODO prevent possible multiple enumerations
+            var toHide = tagsToHide.ToList();
+            //get method name 
+            var methodName = method.Name;
+            foreach (var parameter in method.GetParameters())
             {
-                if (operation.Parameters == null)
-                {
-                    operation.Parameters = new List<OpenApiParameter>();
-                }
+                if (operation.Parameters == null) operation.Parameters = new List<OpenApiParameter>();
 
-                OpenApiParameterAttribute attribute = parameter.GetCustomAttribute<OpenApiParameterAttribute>();
+                var attribute = parameter.GetCustomAttribute<OpenApiParameterAttribute>();
 
-                bool isHidden = false;
-                foreach (OpenApiTagAttribute tagAttribute in parameter.GetCustomAttributes<OpenApiTagAttribute>())
-                {
-                    if (tagsToHide.Contains(tagAttribute.Tag))
-                    {
+                var isHidden = false;
+                foreach (var tagAttribute in parameter.GetCustomAttributes<OpenApiTagAttribute>())
+                    if (toHide.Contains(tagAttribute.Tag))
                         isHidden = true;
-                    }
-                }
 
-                OpenApiHiddenAttribute hiddenAttribute = parameter.GetCustomAttribute<OpenApiHiddenAttribute>();
+                var hiddenAttribute = parameter.GetCustomAttribute<OpenApiHiddenAttribute>();
 
-                if (isHidden || hiddenAttribute != null)
-                {
-                    continue;
-                }
+                if (isHidden || hiddenAttribute != null) continue;
 
-                UriTemplate uriTemplate = new UriTemplate(uriTemplateRaw);
+                var uriTemplate = new UriTemplate(uriTemplateRaw);
                 ParameterLocation? parameterLocation = null;
-                if (uriTemplate.PathSegmentVariableNames.Any(variableName => string.Equals(variableName, parameter.Name, StringComparison.OrdinalIgnoreCase)))
-                {
+                if (uriTemplate.PathSegmentVariableNames.Any(variableName =>
+                        string.Equals(variableName, parameter.Name, StringComparison.OrdinalIgnoreCase)))
                     parameterLocation = ParameterLocation.Path;
-                }
-                else if (uriTemplate.QueryValueVariableNames.Any(variableName => string.Equals(variableName, parameter.Name, StringComparison.OrdinalIgnoreCase)))
-                {
+                else if (uriTemplate.QueryValueVariableNames.Any(variableName =>
+                             string.Equals(variableName, parameter.Name, StringComparison.OrdinalIgnoreCase)))
                     parameterLocation = ParameterLocation.Query;
-                }
 
-                Dictionary<string, StringValues> queryString = QueryHelpers.ParseQuery(new Uri("http://microsoft.com" + uriTemplateRaw).Query);
-                string name = parameter.Name;
+                var queryString =
+                    QueryHelpers.ParseQuery(new Uri("http://microsoft.com" + uriTemplateRaw).Query);
+                var name = parameter.Name;
                 if (parameterLocation == ParameterLocation.Query && queryString.ContainsValue("{" + parameter.Name + "}"))
                 {
-                    KeyValuePair<string, StringValues> queryStringParameter = queryString.First(kvp => kvp.Value == "{" + parameter.Name + "}");
+                    var queryStringParameter =
+                        queryString.First(kvp => kvp.Value == "{" + parameter.Name + "}");
                     name = queryStringParameter.Key;
                 }
 
-                DataContractAttribute dataContractAttribute = parameter.ParameterType.GetCustomAttribute<DataContractAttribute>();
+                //TODO if parameterType is List ???
+                var actualType = parameter.ParameterType.IsArray
+                    ? parameter.ParameterType.GetElementType()
+                    : parameter.ParameterType;
+
+                var dataContractAttribute = actualType.GetCustomAttribute<DataContractAttribute>();
                 if (parameterLocation == null)
                 {
                     OpenApiMediaType content;
-
-                    if (!string.IsNullOrEmpty(dataContractAttribute?.Name))
+                    if (dataContractAttribute != null)
                     {
-                        PopulateOpenApiSchema(document, parameter.ParameterType, tagsToHide, nsManager);
-
-                        content = new OpenApiMediaType
-                        {
-                            Schema = new OpenApiSchema
+                        //TODO
+                        PopulateOpenApiSchema(document, actualType, toHide, nsManager, customTypeMappings);
+                        // PopulateOpenApiSchema(document, actualType, toHide, nsManager, customTypeMappings);
+                        //TODO if method parameter is reference array with datacontract attribute
+                        if (parameter.ParameterType.IsArray)
+                            content = new OpenApiMediaType
                             {
-                                Reference = new OpenApiReference
+                                Schema = new OpenApiSchema
                                 {
-                                    Type = ReferenceType.Schema,
-                                    Id = dataContractAttribute.Name
+                                    Type = "array",
+                                    Items = new OpenApiSchema
+                                    {
+                                        Reference = new OpenApiReference
+                                        {
+                                            Type = ReferenceType.Schema,
+                                            Id
+                                                // Id = GetSchemaKey(innerDataMemberAttribute, innerDataMemberAttribute, true),
+                                                = dataContractAttribute?.Name ?? actualType.FullName
+                                        },
+                                        Xml = new OpenApiXml
+                                        {
+                                            Namespace = new Uri(ArrayNamespace),
+                                            //TODO
+                                            // Name = innerDataMemberAttribute.Name,
+                                            Name = actualType.Name,
+                                            Prefix = FindPrefix(nsManager, ArrayNamespace)
+                                        }
+                                    }
                                 }
-                            }
-                        };
+                            };
+                        else
+                            content = new OpenApiMediaType
+                            {
+                                Schema = new OpenApiSchema
+                                {
+                                    Reference = new OpenApiReference
+                                    {
+                                        Type = ReferenceType.Schema,
+                                        Id = dataContractAttribute?.Name ?? actualType.FullName
+                                    }
+                                }
+                            };
                     }
                     else
                     {
@@ -520,39 +655,42 @@ namespace CoreWCF.OpenApi
                         {
                             Schema = new OpenApiSchema
                             {
-                                Type = GetType(parameter.ParameterType)
+                                Type = GetJSONSchemaType(actualType),
+                                Format = GetFormatType(actualType)
                             }
                         };
                     }
 
                     if (attribute?.ContentTypes != null)
-                    {
                         operation.RequestBody = new OpenApiRequestBody
                         {
                             Content = attribute.ContentTypes.ToDictionary(contentType => contentType, _ => content),
                             Required = !parameter.IsOptional,
                             Description = attribute?.Description
                         };
-                    }
                     else
-                    {
                         operation.RequestBody = new OpenApiRequestBody
                         {
-                            Content = defaultContentType.GetContentTypes(false).ToDictionary(contentType => contentType, _ => content),
+                            //TODO
+                            Content = defaultContentType.GetContentTypes(false)
+                                .ToDictionary(contentType => contentType, _ => content),
                             Required = !parameter.IsOptional,
                             Description = attribute?.Description
                         };
-                    }
                 }
                 else
                 {
+                    //TODO
                     operation.Parameters.Add(new OpenApiParameter
                     {
                         Name = name,
                         Description = attribute?.Description,
                         Schema = new OpenApiSchema
                         {
-                            Type = GetType(parameter.ParameterType)
+                            Type = GetJSONSchemaType(actualType),
+                            // Format = enums != null ? "enum" : null,
+                            Format = GetFormatType(actualType),
+                            Enum = GetEnumValuesAsOpenApiStrings(actualType)
                         },
                         In = parameterLocation,
                         Required = !parameter.IsOptional || parameterLocation == ParameterLocation.Path
@@ -569,22 +707,17 @@ namespace CoreWCF.OpenApi
         /// <param name="method">The given method.</param>
         private static void PopulateOpenApiOperationTags(OpenApiDocument document, OpenApiOperation operation, MethodInfo method)
         {
-            foreach (OpenApiTagAttribute attribute in method.GetCustomAttributes<OpenApiTagAttribute>())
+            foreach (var attribute in method.GetCustomAttributes<OpenApiTagAttribute>())
             {
-                if (operation.Tags == null)
-                {
-                    operation.Tags = new List<OpenApiTag>();
-                }
+                if (operation.Tags == null) operation.Tags = new List<OpenApiTag>();
 
                 operation.Tags.Add(new OpenApiTag { Name = attribute.Tag });
 
-                if (!document.Tags.Any(existingTag => existingTag.Name == attribute.Tag))
-                {
+                if (document.Tags.All(existingTag => existingTag.Name != attribute.Tag))
                     document.Tags.Add(new OpenApiTag
                     {
                         Name = attribute.Tag
                     });
-                }
             }
         }
 
@@ -601,6 +734,8 @@ namespace CoreWCF.OpenApi
                 operation.Summary = operationSummaryAttribute.Summary;
                 operation.Description = operationSummaryAttribute.Description;
             }
+
+            if (method.GetCustomAttribute<ObsoleteAttribute>() != null) operation.Deprecated = true;
         }
 
         /// <summary>
@@ -610,62 +745,100 @@ namespace CoreWCF.OpenApi
         /// <param name="definition">The given type.</param>
         /// <param name="tagsToHide">Any tags that need to be hidden for some reason.</param>
         /// <param name="nsManager">XmlNamespaceManager instance.</param>
-        private static void PopulateOpenApiSchema(OpenApiDocument document, Type definition, IEnumerable<string> tagsToHide, XmlNamespaceManager nsManager)
+        private static void PopulateOpenApiSchema(OpenApiDocument document,
+            Type definition, List<string> tagsToHide,
+            XmlNamespaceManager nsManager,
+            IReadOnlyDictionary<Type, Func<OpenApiSchema>> customTypeMappings)
         {
-            bool IsContractAndIsNewContract(Type parentType, Type type, HashSet<string> seenKeys, bool isInArray)
-            {
-                DataContractAttribute parentDataContractAttribute = parentType?.GetCustomAttribute<DataContractAttribute>();
-                DataContractAttribute dataContractAttribute = type?.GetCustomAttribute<DataContractAttribute>();
+            var seenKeys = new HashSet<string>();
+            var queue = new Queue<(Type parent, Type type, bool isInArray)>();
 
-                if (dataContractAttribute?.Name == null)
-                {
-                    return false;
-                }
+            var realDefinitionType = definition.IsArray
+                ? definition.GetElementType() ?? definition.GetGenericArguments()[0]
+                : definition;
 
-                string schemaKey = GetSchemaKey(parentDataContractAttribute, dataContractAttribute, isInArray);
-                if (seenKeys.Contains(schemaKey))
-                {
-                    return false;
-                }
-                else
-                {
-                    seenKeys.Add(schemaKey);
-                }
-
-                return !document.Components.Schemas.ContainsKey(GetSchemaKey(parentDataContractAttribute, dataContractAttribute, isInArray));
-            }
-
-            bool IsDataMemberProperty(PropertyInfo property) => property.GetCustomAttribute<DataMemberAttribute>() != null;
-
-            HashSet<string> seenKeys = new HashSet<string>();
-
-            if (!IsContractAndIsNewContract(null, definition, seenKeys, false))
-            {
-                return;
-            }
-
-            Queue<(Type parent, Type type, bool isInArray)> queue = new Queue<(Type parent, Type type, bool isInArary)>();
-            queue.Enqueue((null, definition, false));
+            if (IsContractAndIsNewContract(null, realDefinitionType, seenKeys, definition.IsArray))
+                queue.Enqueue((null, realDefinitionType, definition.IsArray));
 
             while (queue.Any())
             {
                 (Type parent, Type type, bool isInArray) = queue.Dequeue();
-                AddTypeToSchemas(document, parent, type, isInArray, tagsToHide, nsManager);
+                AddTypeToSchemas(document, parent, type, isInArray, tagsToHide, nsManager, customTypeMappings);
 
-                foreach (PropertyInfo property in type.GetProperties().Where(IsDataMemberProperty))
+                foreach (var property in type.GetProperties())
                 {
-                    if (IsContractAndIsNewContract(type, property.PropertyType, seenKeys, false))
+                    var propertyTypeKind = GetTypeKind(property.PropertyType, out var actualType);
+
+                    if (!IsDataMemberProperty(property))
+                        continue;
+
+                    switch (propertyTypeKind)
                     {
-                        queue.Enqueue((type, property.PropertyType, false));
-                    }
-                    else if (
-                        property.PropertyType.GetInterface("IEnumerable") != null &&
-                        property.PropertyType != typeof(string) &&
-                        IsContractAndIsNewContract(type, property.PropertyType.GetGenericArguments().FirstOrDefault(), seenKeys, true))
-                    {
-                        queue.Enqueue((type, property.PropertyType.GetGenericArguments().FirstOrDefault(), true));
+                        case TypeKind.UnderlyingType:
+                        case TypeKind.EnumType:
+                            if (IsContractAndIsNewContract(type, actualType, seenKeys, actualType.IsArray))
+                                queue.Enqueue((type, actualType, actualType.IsArray));
+                            break;
+                        case TypeKind.EnumerableType:
+                        case TypeKind.ArrayType:
+                            var isGenericList = property.PropertyType.IsArray || (property.PropertyType.IsGenericType &&
+                                                                                  property.PropertyType
+                                                                                      .GetGenericTypeDefinition() ==
+                                                                                  typeof(List<>));
+                            if (IsContractAndIsNewContract(type, actualType, seenKeys, isGenericList))
+                                queue.Enqueue((type, actualType, isGenericList));
+                            break;
+                        case TypeKind.InterfaceType:
+                            ProcessInterfaceProperty(document, type, property, customTypeMappings);
+                            break;
+                        case TypeKind.None:
+                            if (IsContractAndIsNewContract(type, property.PropertyType, seenKeys,
+                                    property.PropertyType.IsArray))
+                                queue.Enqueue((type, property.PropertyType, property.PropertyType.IsArray));
+                            break;
                     }
                 }
+            }
+        }
+
+        private static bool IsDataMemberProperty(PropertyInfo property)
+            => property.GetCustomAttribute<DataMemberAttribute>() != null;
+
+        private static bool IsContractAndIsNewContract(Type parent, Type type, HashSet<string> seenKeys, bool isInArray)
+        {
+            var parentDataContractAttribute = parent?.GetCustomAttribute<DataContractAttribute>();
+            var dataContractAttribute = type.GetCustomAttribute<DataContractAttribute>();
+            if (dataContractAttribute == null) return false;
+            //TODO We remain on the scenario of ‘DataContract’ name and namespace usage, but add the schema name (by type.Name) when they are missing.
+            var schemaKey = GetSchemaKey(parentDataContractAttribute, dataContractAttribute, type, isInArray);
+            if (seenKeys.Contains(schemaKey)) return false;
+
+            seenKeys.Add(schemaKey);
+            return true;
+        }
+
+        private static void ProcessInterfaceProperty(OpenApiDocument document, Type type, PropertyInfo property,
+            IReadOnlyDictionary<Type, Func<OpenApiSchema>> customTypeMappings)
+        {
+            var typeName = type.Name;
+            var propertyName = property.Name;
+            var schemaKey = GetSchemaKey(null, null, property.PropertyType, false);
+            if (document.Components.Schemas.TryGetValue(schemaKey, out var existInterfaceSchema))
+            {
+                var underlyingTypes = type.GetCustomAttributes<KnownTypeAttribute>().ToList();
+                var knownTypesSchemas = new List<OpenApiSchema>();
+
+                foreach (var knownTypeAttribute in underlyingTypes)
+                    if (knownTypeAttribute.Type != null &&
+                        customTypeMappings.TryGetValue(knownTypeAttribute.Type, out var customTypeSchema))
+                        knownTypesSchemas.Add(customTypeSchema());
+
+                existInterfaceSchema.Properties.Add(property.Name,
+                    new OpenApiSchema
+                    {
+                        Type = "object",
+                        OneOf = knownTypesSchemas
+                    });
             }
         }
 
@@ -676,41 +849,53 @@ namespace CoreWCF.OpenApi
         /// <param name="dataContractAttribute">The data contract attribute for the type to add.</param>
         /// <param name="dataContractAttribute">Whether the type is wrapped in an array or not.</param>
         /// <returns>The key to store the schema under.</returns>
-        private static string GetSchemaKey(DataContractAttribute parentDataContractAttribute, DataContractAttribute dataContractAttribute, bool isInArray)
+        private static string GetSchemaKey(DataContractAttribute parentDataContractAttribute, DataContractAttribute dataContractAttribute, Type type, bool isInArray)
         {
-            if (parentDataContractAttribute != null && isInArray)
-            {
-                return $"{parentDataContractAttribute.Name}-Array-{dataContractAttribute.Name}";
-            }
-            else if (parentDataContractAttribute != null)
-            {
-                return $"{parentDataContractAttribute.Name}-{dataContractAttribute.Name}";
-            }
-            else
-            {
-                return dataContractAttribute.Name;
-            }
+            var keySchema = "";
+            if (parentDataContractAttribute?.Name != null && isInArray)
+                keySchema = $"{parentDataContractAttribute.Name}-Array-{dataContractAttribute?.Name}";
+            else if (parentDataContractAttribute?.Name != null)
+                keySchema = $"{parentDataContractAttribute.Name}-{dataContractAttribute?.Name}";
+            else if (dataContractAttribute?.Name != null)
+                keySchema = $"{dataContractAttribute?.Name}";
+            else keySchema = $"{type?.Namespace}.{type?.Name}";
+
+            return keySchema;
         }
 
         /// <summary>
-        /// Add a specific definition to the schemas section.
+        ///     Add a specific definition to the schemas section.
         /// </summary>
         /// <param name="document">The document object that is being built up.</param>
         /// <param name="parent">The parent of the type to add.</param>
         /// <param name="type">The type to add.</param>
-        /// <param name="type">Whether the type is in an array.</param>
+        /// <param name="isInArray">Whether the type is in an array.</param>
         /// <param name="tagsToHide">Any tags that need to be hidden for some reason.</param>
         /// <param name="nsManager">XmlNamespaceManager instance.</param>
-        private static void AddTypeToSchemas(OpenApiDocument document, Type parent, Type type, bool isInArray, IEnumerable<string> tagsToHide, XmlNamespaceManager nsManager)
+        /// <param name="customTypeMappings"></param>
+        private static void AddTypeToSchemas(OpenApiDocument document,
+            Type parent, Type type,
+            bool isInArray, List<string> tagsToHide, XmlNamespaceManager nsManager,
+            IReadOnlyDictionary<Type, Func<OpenApiSchema>> customTypeMappings)
         {
             DataContractAttribute parentDataContractAttribute = parent?.GetCustomAttribute<DataContractAttribute>();
             DataContractAttribute dataContractAttribute = type.GetCustomAttribute<DataContractAttribute>();
 
-            string parentNs = FindNamespace(parentDataContractAttribute?.Namespace ?? dataContractAttribute?.Namespace, parent ?? type);
-            string parentPrefix = FindPrefix(nsManager, parentNs);
+            // string parentNs = FindNamespace(parentDataContractAttribute?.Namespace ?? dataContractAttribute?.Namespace, parent ?? type);
+            // string parentPrefix = FindPrefix(nsManager, parentNs);
+            //
+            // string ns = FindNamespace(dataContractAttribute?.Namespace, type);
+            // string prefix = FindPrefix(nsManager, ns);
 
-            string ns = FindNamespace(dataContractAttribute?.Namespace, type);
-            string prefix = FindPrefix(nsManager, ns);
+            var parentNs =
+                FindNamespace(
+                    parentDataContractAttribute != null
+                        ? parentDataContractAttribute.Namespace
+                        : dataContractAttribute?.Namespace ?? parent?.Namespace, parent ?? type);
+            var parentPrefix = FindPrefix(nsManager, parentNs);
+
+            var ns = FindNamespace(dataContractAttribute?.Namespace ?? type.Namespace, type);
+            var prefix = FindPrefix(nsManager, ns);
 
             Dictionary<string, IOpenApiExtension> xmlBlock = isInArray ?
                 new Dictionary<string, IOpenApiExtension>
@@ -733,208 +918,393 @@ namespace CoreWCF.OpenApi
                     }
                 };
 
-            SortedSet<string> required = new SortedSet<string>();
-            OpenApiSchema definitionSchema = new OpenApiSchema
-            {
-                Type = "object",
-                Properties = new Dictionary<string, OpenApiSchema>(),
-                // The URI type might mangle the namespace so we do this manually.
-                Extensions = xmlBlock,
-            };
+                var required = new SortedSet<string>();
 
-            IEnumerable<(PropertyInfo, DataMemberAttribute)> properties = type
-                .GetProperties()
-                .Select(property => (Property: property, DataMemberAttribute: property.GetCustomAttribute<DataMemberAttribute>()))
-                .Where(property => property.DataMemberAttribute != null)
-                .OrderBy(property => property.DataMemberAttribute.Order);
-
-            foreach ((PropertyInfo property, DataMemberAttribute dataMemberAttribute) in properties)
-            {
-                OpenApiHiddenAttribute hiddenAttribute = property.GetCustomAttribute<OpenApiHiddenAttribute>();
-                if (hiddenAttribute != null)
+                OpenApiSchema definitionSchema;
+                if (customTypeMappings.TryGetValue(type, out var foundedType))
                 {
-                    continue;
+                    definitionSchema = foundedType();
+                    definitionSchema.Extensions = xmlBlock;
                 }
-
-                bool isHidden = false;
-                foreach (OpenApiTagAttribute tagAttribute in property.GetCustomAttributes<OpenApiTagAttribute>())
+                //TODO performing Enum processing if type is enum with assigned DataContractAttribute
+                else if (type.IsEnum)
                 {
-                    if (tagsToHide.Contains(tagAttribute.Tag))
+                    definitionSchema = new OpenApiSchema
                     {
-                        isHidden = true;
-                    }
+                        Type = GetJSONSchemaType(type),
+                        Format = GetFormatType(type),
+                        // Format = "enum",
+                        Description = type.GetCustomAttribute<DescriptionAttribute>()?.Description,
+                        Enum = GetEnumValuesAsOpenApiStrings(type)
+                    };
                 }
-
-                if (isHidden)
+                else
                 {
-                    continue;
+                    definitionSchema = new OpenApiSchema
+                    {
+                        Type = "object",
+                        //TODO
+                        Description = type.GetCustomAttribute<DescriptionAttribute>()?.Description,
+                        Properties = new Dictionary<string, OpenApiSchema>(),
+                        Extensions = xmlBlock
+                    };
+
+                    ProcessTypeAttributes(definitionSchema, parentDataContractAttribute, dataContractAttribute, parent, type,
+                        tagsToHide, required, nsManager);
                 }
 
-                string name = dataMemberAttribute.Name ?? property.Name;
+                definitionSchema.Required = required.Count > 0 ? required : null;
+            //schemas is IDictionary check if key exist with frameworsk: 4.7.2, net6 net7
+            if (document.Components.Schemas.ContainsKey(GetSchemaKey(parentDataContractAttribute, dataContractAttribute,
+                    type, isInArray)))
+            {
+                document.Components.Schemas[
+                        GetSchemaKey(parentDataContractAttribute, dataContractAttribute, type, isInArray)] =
+                    definitionSchema;
+            }
+            else
+            {
+                document.Components.Schemas.Add(
+                    GetSchemaKey(parentDataContractAttribute, dataContractAttribute, type, isInArray),
+                    definitionSchema);
+            }
+            // document.Components.Schemas.Add(
+            //     GetSchemaKey(parentDataContractAttribute, dataContractAttribute, type, isInArray), definitionSchema);
+        }
 
-                OpenApiPropertyAttribute memberPropertiesAttribute = property.GetCustomAttribute<OpenApiPropertyAttribute>();
+        /// <summary>
+        ///     Processes the attributes of a given type and updates the provided OpenApiSchema definition.
+        /// </summary>
+        /// <param name="definitionSchema">The OpenApiSchema definition to be updated.</param>
+        /// <param name="parentDataContractAttribute">The DataContractAttribute of the parent type.</param>
+        /// <param name="dataContractAttribute">The DataContractAttribute of the type to be processed.</param>
+        /// <param name="parent">The parent type of the type to be processed.</param>
+        /// <param name="type">The type whose attributes are to be processed.</param>
+        /// <param name="tagsToHide">A list of tags to be hidden.</param>
+        /// <param name="required">A SortedSet of required properties.</param>
+        /// <param name="nsManager">The XmlNamespaceManager for managing namespaces.</param>
+        private static void ProcessTypeAttributes(OpenApiSchema definitionSchema,
+            DataContractAttribute parentDataContractAttribute, DataContractAttribute dataContractAttribute,
+            Type parent,
+            Type type,
+            List<string> tagsToHide,
+            SortedSet<string> required,
+            XmlNamespaceManager nsManager)
+        {
+            var properties = type
+                .GetProperties()
+                .Select(property => (Property: property,
+                    DataMemberAttribute: property.GetCustomAttribute<DataMemberAttribute>()))
+                .Where(property => property.DataMemberAttribute != null || (property is { DataMemberAttribute: not null } &&
+                                                                            property.Property.GetGetMethod(true)!
+                                                                                .IsPrivate))
+                .OrderBy(property => property.DataMemberAttribute.Order).ToList();
+
+            if (properties.Any())
+                ProcessProperties(definitionSchema, parentDataContractAttribute, dataContractAttribute, tagsToHide,
+                    required, nsManager, properties);
+            //TODO if you prefer: performing Fields processing
+        }
+
+        /// <summary>
+        ///     Processes the properties of a given type and adds them to the OpenAPI schema.
+        /// </summary>
+        /// <param name="definitionSchema">The OpenAPI schema to which the properties will be added.</param>
+        /// <param name="parentDataContractAttribute">The DataContract attribute of the parent type.</param>
+        /// <param name="dataContractAttribute">The DataContract attribute of the type.</param>
+        /// <param name="tagsToHide">A list of tags to be hidden in the OpenAPI documentation.</param>
+        /// <param name="required">A set of required properties.</param>
+        /// <param name="nsManager">The XML namespace manager.</param>
+        /// <param name="properties">The properties to be processed and added to the OpenAPI schema.</param>
+        private static void ProcessProperties(OpenApiSchema definitionSchema,
+            DataContractAttribute parentDataContractAttribute, DataContractAttribute dataContractAttribute,
+            List<string> tagsToHide, SortedSet<string> required,
+            XmlNamespaceManager nsManager,
+            IEnumerable<(PropertyInfo, DataMemberAttribute)> properties)
+        {
+            foreach (var (property, dataMemberAttribute) in properties)
+            {
+                if (property == null) continue;
+
+                var hiddenAttribute = property.GetCustomAttribute<OpenApiHiddenAttribute>();
+                if (hiddenAttribute != null) continue;
+
+                var isHidden = false;
+                foreach (var tagAttribute in property.GetCustomAttributes<OpenApiTagAttribute>())
+                    if (tagsToHide.Contains(tagAttribute.Tag))
+                        isHidden = true;
+
+                if (isHidden) continue;
+
+                var name = dataMemberAttribute.Name ?? property.Name;
+
+                var memberPropertiesAttribute =
+                    property.GetCustomAttribute<OpenApiPropertyAttribute>();
 
                 IEnumerable<CustomAttributeNamedArgument> memberPropertiesAttributeData = property
-                        .GetCustomAttributesData()
-                        .FirstOrDefault(data => data.AttributeType == typeof(OpenApiPropertyAttribute))
-                        ?.NamedArguments;
-                bool maxLengthSet = memberPropertiesAttributeData?.Any(arg => arg.MemberName == "MaxLength") ?? false;
-                bool minLengthSet = memberPropertiesAttributeData?.Any(arg => arg.MemberName == "MinLength") ?? false;
+                    .GetCustomAttributesData()
+                    .FirstOrDefault(data => data.AttributeType == typeof(OpenApiPropertyAttribute))
+                    ?.NamedArguments;
+                var maxLengthSet = memberPropertiesAttributeData?.Any(arg => arg.MemberName == "MaxLength") ?? false;
+                var minLengthSet = memberPropertiesAttributeData?.Any(arg => arg.MemberName == "MinLength") ?? false;
 
-                if (memberPropertiesAttribute?.IsRequired ?? false)
+                if (memberPropertiesAttribute?.IsRequired ?? false) required.Add(name);
+
+                ProcessTypeToSchema(parentDataContractAttribute, dataContractAttribute, name,
+                    definitionSchema, property, memberPropertiesAttribute, nsManager);
+            }
+        }
+
+        /// <summary>
+        ///     Processes the given type to an OpenApiSchema.
+        /// </summary>
+        /// <param name="parentDataContractAttribute">The parent data contract attribute.</param>
+        /// <param name="dataContractAttribute">The data contract attribute of the processed type.</param>
+        /// <param name="name">The name of the property.</param>
+        /// <param name="definitionSchema">The OpenApiSchema to which the processed type will be added.</param>
+        /// <param name="property">The property info of the processed type.</param>
+        /// <param name="memberPropertiesAttribute">The OpenApiPropertyAttribute of the processed type.</param>
+        /// <param name="nsManager">The XmlNamespaceManager for managing namespaces.</param>
+        private static void ProcessTypeToSchema(DataContractAttribute parentDataContractAttribute,
+            DataContractAttribute dataContractAttribute, string name, OpenApiSchema definitionSchema,
+            PropertyInfo property, OpenApiPropertyAttribute memberPropertiesAttribute, XmlNamespaceManager nsManager)
+        {
+            var innerDataContractAttribute =
+                property.PropertyType.GetCustomAttribute<DataContractAttribute>();
+
+            string schemaKey;
+            if (innerDataContractAttribute != null)
+            {
+                schemaKey = GetSchemaKey(dataContractAttribute, innerDataContractAttribute, property.PropertyType,
+                    property.PropertyType.IsArray);
+                definitionSchema.Properties.Add(name, new OpenApiSchema
                 {
-                    required.Add(name);
-                }
-
-                DataContractAttribute innerDataContractAttribute = property.PropertyType.GetCustomAttribute<DataContractAttribute>();
-                if (innerDataContractAttribute?.Name != null)
-                {
-                    DataContractAttribute innerDataMemberAttribute = property.PropertyType.GetCustomAttribute<DataContractAttribute>();
-
-                    definitionSchema.Properties.Add(name, new OpenApiSchema
+                    Reference = new OpenApiReference
                     {
-                        Reference = new OpenApiReference
+                        Type = ReferenceType.Schema,
+                        Id = schemaKey
+                    },
+                    Description = memberPropertiesAttribute?.Description
+                });
+            }
+            else
+            {
+                var propertyTypeKind = GetTypeKind(property.PropertyType, out var actualType);
+                switch (propertyTypeKind)
+                {
+                    case TypeKind.UnderlyingType:
+                        var underlyingTypeDataContract = actualType.GetCustomAttribute<DataContractAttribute>();
+                        schemaKey = GetSchemaKey(parentDataContractAttribute, underlyingTypeDataContract, actualType,
+                            false);
+                        definitionSchema.Properties.Add(name, new OpenApiSchema
                         {
-                            Type = ReferenceType.Schema,
-                            Id = GetSchemaKey(dataContractAttribute, innerDataMemberAttribute, false)
-                        },
-                        Description = memberPropertiesAttribute?.Description
-                    });
-                }
-                else if (property.PropertyType.GetInterface("IEnumerable") != null && property.PropertyType != typeof(string))
-                {
-                    // Handles the case of a custom collection that derives from a specialized generic collection.
-                    Type innerType = property.PropertyType.GetGenericArguments().FirstOrDefault();
-                    if (innerType == null && property.PropertyType.BaseType != null)
-                    {
-                        innerType = property.PropertyType.BaseType.GetGenericArguments().FirstOrDefault();
-                    }
-
-                    if (innerType != null)
-                    {
-                        DataContractAttribute innerDataMemberAttribute = innerType.GetCustomAttribute<DataContractAttribute>();
-                        if (innerDataMemberAttribute != null)
-                        {
-                            definitionSchema.Properties.Add(name, new OpenApiSchema
+                            Reference = new OpenApiReference
                             {
-                                Type = "array",
-                                Description = memberPropertiesAttribute?.Description,
+                                Type = ReferenceType.Schema,
+                                Id = schemaKey
+                            },
+                            Description = memberPropertiesAttribute?.Description ??
+                                          property.GetCustomAttribute<DescriptionAttribute>()?.Description
+                        });
+                        break;
+                    case TypeKind.ArrayType:
+                        var innerArrayTypeDataContractAttribute =
+                            actualType.GetCustomAttribute<DataContractAttribute>();
+                        if (innerArrayTypeDataContractAttribute != null)
+                        {
+                            schemaKey = GetSchemaKey(parentDataContractAttribute, innerArrayTypeDataContractAttribute,
+                                actualType, true);
+                            var newSchema = new OpenApiSchema
+                            {
+                                Type = GetJSONSchemaType(property.PropertyType),
+                                Description = memberPropertiesAttribute?.Description ??
+                                              property.GetCustomAttribute<DescriptionAttribute>()?.Description,
                                 Items = new OpenApiSchema
                                 {
                                     Reference = new OpenApiReference
                                     {
                                         Type = ReferenceType.Schema,
-                                        Id = GetSchemaKey(dataContractAttribute, innerDataMemberAttribute, true),
+
+                                        Id = schemaKey
                                     },
                                     Xml = new OpenApiXml
                                     {
                                         Namespace = new Uri(ArrayNamespace),
-                                        Name = innerDataMemberAttribute.Name,
+                                        Name = actualType.Name,
                                         Prefix = FindPrefix(nsManager, ArrayNamespace)
                                     }
-                                },
-                                // The URI type might mangle the namespace so we do this manually.
-                                Extensions = new Dictionary<string, IOpenApiExtension>
-                                {
-                                    {"xml", new OpenApiObject
-                                        {
-                                            {"name", new OpenApiString(name) },
-                                            {"namespace", new OpenApiString(parentNs)},
-                                            {"prefix", new OpenApiString(parentPrefix)},
-                                            {"wrapped", new OpenApiBoolean(true) }
-                                        }
-                                    }
-                                },
-                            });
+                                }
+                            };
+                            definitionSchema.Properties.Add(name, newSchema);
                         }
                         else
                         {
-                            string openApiType = GetType(innerType);
-
+                            //TODO array with primitive types
+                            var openApiType = GetJSONSchemaType(actualType);
                             if (!string.IsNullOrEmpty(openApiType))
-                            {
                                 definitionSchema.Properties.Add(name, new OpenApiSchema
                                 {
-                                    Type = "array",
-                                    Description = memberPropertiesAttribute?.Description,
+                                    Type = GetJSONSchemaType(property.PropertyType),
+                                    Description = memberPropertiesAttribute?.Description ??
+                                                  property.GetCustomAttribute<DescriptionAttribute>()?.Description,
                                     Items = new OpenApiSchema
                                     {
                                         Type = openApiType,
                                         Xml = new OpenApiXml
                                         {
                                             Namespace = new Uri(ArrayNamespace),
-                                            Name = innerType.Name.ToLower(),
+                                            //TODO
+                                            // Name = innerDataMemberAttribute.Name,
+                                            Name = actualType.Name,
                                             Prefix = FindPrefix(nsManager, ArrayNamespace)
                                         }
-                                    },
-                                    // The URI type might mangle the namespace so we do this manually.
-                                    Extensions = new Dictionary<string, IOpenApiExtension>
-                                    {
-                                        {"xml", new OpenApiObject
-                                            {
-                                                {"name", new OpenApiString(name) },
-                                                {"namespace", new OpenApiString(parentNs)},
-                                                {"prefix", new OpenApiString(parentPrefix)},
-                                                {"wrapped", new OpenApiBoolean(true) }
-                                            }
-                                        }
-                                    },
-                                }); ;
-                            }
+                                    }
+                                });
                         }
-                    }
-                }
-                else if (property.PropertyType.IsEnum)
-                {
-                    List<IOpenApiAny> enumValues = new List<IOpenApiAny>();
-                    foreach (object value in Enum.GetValues(property.PropertyType))
-                    {
-                        enumValues.Add(new OpenApiString(value.ToString()));
-                    }
 
-                    definitionSchema.Properties.Add(name, new OpenApiSchema
-                    {
-                        Type = "string",
-                        Description = memberPropertiesAttribute?.Description,
-                        Enum = enumValues,
-                        // The URI type might mangle the namespace so we do this manually.
-                        Extensions = new Dictionary<string, IOpenApiExtension>
+                        break;
+                    case TypeKind.EnumType:
+                        definitionSchema.Properties.Add(name, new OpenApiSchema
                         {
-                            {"xml", new OpenApiObject
-                                {
-                                    {"namespace", new OpenApiString(ns)},
-                                    {"prefix", new OpenApiString(prefix)}
-                                }
-                            }
-                        }
-                    });
-                }
-                else
-                {
-                    definitionSchema.Properties.Add(name, new OpenApiSchema
-                    {
-                        Type = GetType(property.PropertyType),
-                        Description = memberPropertiesAttribute?.Description,
-                        MinLength = minLengthSet ? memberPropertiesAttribute?.MinLength : null,
-                        MaxLength = maxLengthSet ? memberPropertiesAttribute?.MaxLength : null,
-                        Format = memberPropertiesAttribute?.Format,
-                        // The URI type might mangle the namespace so we do this manually.
-                        Extensions = new Dictionary<string, IOpenApiExtension>
+                            Type = GetJSONSchemaType(property.PropertyType),
+                            Format = memberPropertiesAttribute?.Format ?? GetFormatType(property.PropertyType),
+                            Description = memberPropertiesAttribute?.Description ??
+                                          property.GetCustomAttribute<DescriptionAttribute>()?.Description,
+                            Enum = GetEnumValuesAsOpenApiStrings(property.PropertyType),
+                            Default = GetCustomDefaultValue(property.PropertyType) ?? GetDefaultValueAttribute(property)
+                        });
+                        break;
+                    case TypeKind.EnumerableType:
+                        innerArrayTypeDataContractAttribute =
+                            actualType.GetCustomAttribute<DataContractAttribute>();
+                        if (innerArrayTypeDataContractAttribute != null)
                         {
-                            {"xml", new OpenApiObject
+                            // ProcessTypeAttributes(definitionSchema, parent, arrayType, tagsToHide, required, parentNs, parentPrefix, nsManager, ns, prefix);
+                            var newSchema = new OpenApiSchema
+                            {
+                                Type = "array",
+                                Description = memberPropertiesAttribute?.Description ??
+                                              property.GetCustomAttribute<DescriptionAttribute>()?.Description,
+                                Items = new OpenApiSchema
                                 {
-                                    {"namespace", new OpenApiString(ns)},
-                                    {"prefix", new OpenApiString(prefix)}
+                                    Reference = new OpenApiReference
+                                    {
+                                        Type = ReferenceType.Schema,
+
+                                        // Id = GetSchemaKey(innerDataMemberAttribute, innerDataMemberAttribute, true),
+                                        Id = GetSchemaKey(parentDataContractAttribute, innerArrayTypeDataContractAttribute,
+                                            actualType, true)
+                                    },
+                                    Xml = new OpenApiXml
+                                    {
+                                        Namespace = new Uri(ArrayNamespace),
+                                        //TODO
+                                        // Name = innerDataMemberAttribute.Name,
+                                        Name = actualType.Name,
+                                        Prefix = FindPrefix(nsManager, ArrayNamespace)
+                                    }
                                 }
-                            }
+                            };
+                            definitionSchema.Properties.Add(name, newSchema);
                         }
-                    });
+                        else
+                        {
+                            //TODO array with primitive types
+                            // string openApiType = GetType(innerType);
+                            var openApiType = GetJSONSchemaType(actualType.GetElementType());
+                            if (!string.IsNullOrEmpty(openApiType))
+                                definitionSchema.Properties.Add(name, new OpenApiSchema
+                                {
+                                    Type = "array",
+                                    Description = memberPropertiesAttribute?.Description ??
+                                                  property.GetCustomAttribute<DescriptionAttribute>()?.Description,
+                                    Items = new OpenApiSchema
+                                    {
+                                        Type = openApiType,
+                                        Xml = new OpenApiXml
+                                        {
+                                            // Namespace = new Uri(ArrayNamespace),
+                                            Name = actualType.Name.ToLower()
+                                            // Prefix = FindPrefix(nsManager, ArrayNamespace)
+                                        }
+                                    }
+                                });
+                        }
+
+                        break;
+                    case TypeKind.InterfaceType:
+                        return;
+                    case TypeKind.DateTimeType:
+                    case TypeKind.PrimitiveType:
+                        definitionSchema.Properties.Add(name, new OpenApiSchema
+                        {
+                            Type = GetJSONSchemaType(property.PropertyType),
+                            Default = GetCustomDefaultValue(property.PropertyType) ?? GetDefaultValueAttribute(property),
+                            Description = memberPropertiesAttribute?.Description ??
+                                          property.GetCustomAttribute<DescriptionAttribute>()?.Description,
+                            MinLength = memberPropertiesAttribute?.MinLength,
+                            MaxLength = memberPropertiesAttribute?.MaxLength,
+                            Format = memberPropertiesAttribute?.Format ?? GetFormatType(property.PropertyType)
+                        });
+                        break;
+                    default:
+                        return;
+                        // throw new InvalidOperationException("Unsupported property type: " + processedType.FullName);
                 }
             }
+        }
 
-            definitionSchema.Required = required.Count > 0 ? required : null;
+        // <summary>
+        ///     Gets the default value for the specified open schema of primitive type.
+        /// </summary>
+        /// <param name="type">The type of the value.</param>
+        /// <param name="value"></param>
+        /// <returns>The default value.</returns>
+        private static IOpenApiAny GetCustomDefaultValue(Type type, object value = null)
+        {
+            if (type == typeof(DateTime)) return new OpenApiDateTime(DateTime.Now);
 
-            document.Components.Schemas.Add(GetSchemaKey(parentDataContractAttribute, dataContractAttribute, isInArray), definitionSchema);
+            if (type == typeof(int))
+            {
+                if (value != null) return new OpenApiInteger((int)value);
+            }
+            else if (type == typeof(double))
+            {
+                if (value != null) return new OpenApiDouble((double)value);
+            }
+            else if (type.IsEnum)
+            {
+                if (value != null && value is Enum enumValue) return new OpenApiString(enumValue.ToString());
+            }
+            else if (type == typeof(string))
+            {
+                if (value != null) return new OpenApiString((string)value);
+            }
+
+            // Add more else if blocks here for other types you want to handle
+
+            // If the type is not handled above, return null or throw an exception
+            return null;
+        }
+
+        /// <summary>
+        ///     Retrieves the default value of a property.
+        /// </summary>
+        /// <param name="propertyInfo">The property information.</param>
+        /// <returns>
+        ///     An IOpenApiAny object representing the default value of the property.
+        ///     If the DefaultValueAttribute does not exist, returns null.
+        /// </returns>
+        public static IOpenApiAny GetDefaultValueAttribute(PropertyInfo propertyInfo)
+        {
+            var attribute = propertyInfo.GetCustomAttribute<DefaultValueAttribute>();
+            if (attribute != null)
+            {
+                var value = Convert.ChangeType(attribute.Value, propertyInfo.PropertyType);
+                return GetCustomDefaultValue(propertyInfo.PropertyType, value);
+            }
+
+            return null;
         }
 
         /// <summary>
@@ -969,6 +1339,7 @@ namespace CoreWCF.OpenApi
 
             int index = 0;
             IEnumerator enumerator = nsManager.GetEnumerator();
+            using var unknown = enumerator as IDisposable;
             while (enumerator.MoveNext())
             {
                 index++;
@@ -981,39 +1352,203 @@ namespace CoreWCF.OpenApi
         }
 
         /// <summary>
-        /// Map a .NET type to JSON schema type.
+        ///     Map a .NET type to JSON schema type.
         /// </summary>
         /// <param name="type">The type to be mapped.</param>
         /// <returns>The mapped type.</returns>
-        private static string GetType(Type type)
+        private static string GetJSONSchemaType(Type type)
         {
-            if (type == null)
-            {
-                return null;
-            }
+            if (type == null) return null;
 
-            Type actualType = IsNullable(type) ? Nullable.GetUnderlyingType(type) : type;
+            var actualType = IsNullable(type) ? Nullable.GetUnderlyingType(type) : type;
 
-            if (actualType == typeof(int) || actualType == typeof(long) || actualType == typeof(short) || actualType == typeof(byte) || actualType == typeof(sbyte) || actualType == typeof(ushort) || actualType == typeof(ulong))
-            {
+            if (actualType == typeof(int) || actualType == typeof(long) || actualType == typeof(short) ||
+                actualType == typeof(byte) || actualType == typeof(sbyte) || actualType == typeof(ushort) ||
+                actualType == typeof(ulong))
                 return "integer";
-            }
-            else if (actualType == typeof(float) || actualType == typeof(double) || actualType == typeof(decimal))
-            {
+            if (actualType == typeof(float) || actualType == typeof(double) || actualType == typeof(decimal))
                 return "number";
-            }
-            else if (actualType == typeof(string) || actualType == typeof(DateTime) || actualType == typeof(Stream) || actualType == typeof(Guid) || actualType == typeof(DateTimeOffset) || actualType == typeof(char))
-            {
+            if (actualType == typeof(string) || actualType == typeof(Guid) || actualType == typeof(char)
+                || actualType is { IsEnum: true } || actualType == typeof(DateTime) || actualType == typeof(DateTimeOffset))
+                // || actualType == typeof(DateOnly))
                 return "string";
-            }
-            else if (actualType == typeof(bool))
-            {
+            if (actualType == typeof(bool))
                 return "boolean";
-            }
+            if (type.IsArray || (type.IsGenericType && type.GetGenericTypeDefinition() == typeof(List<>))) return "array";
+
 
             return null;
         }
 
+        /// <summary>
+        ///     Determines the format type of the provided type for the OpenAPI schema.
+        /// </summary>
+        /// <param name="realType">The type to determine the format for.</param>
+        /// <returns>
+        ///     Returns "date-time" if the type is DateTime or DateTimeOffset, "enum" if the type is an enumeration,
+        ///     and null for all other types.
+        /// </returns>
+        private static string GetFormatType(Type realType)
+        {
+            var actualType = IsNullable(realType) ? Nullable.GetUnderlyingType(realType) : realType;
+            if (actualType == typeof(DateTime) || actualType == typeof(DateTimeOffset))
+                return "date-time";
+            // if (actualType == typeof(DateOnly))
+            //     return "date";
+            // if (actualType == typeof(TimeOnly))
+            //     return "time";
+            if (actualType is { IsEnum: true }) return "enum";
+
+            return null;
+        }
+
+        /// <summary>
+        ///     Retrieves the enumeration values of a given type and converts them into a list of OpenApiString objects.
+        /// </summary>
+        /// <param name="type">The Type of the enumeration.</param>
+        /// <returns>
+        ///     A list of IOpenApiAny objects representing the enumeration values. If the provided type is not an enumeration,
+        ///     this method returns null.
+        /// </returns>
+        private static List<IOpenApiAny> GetEnumValuesAsOpenApiStrings(Type type)
+        {
+            var enumType = type.IsEnum
+                ? type
+                : TryGetUnderlyingNullableType(type, out var underlyingType)
+                    ? underlyingType
+                    : null;
+            if (enumType is { IsEnum: true })
+                return Enum.GetValues(enumType)
+                    .Cast<object>()
+                    .Select(value => new OpenApiString(value.ToString()))
+                    .Cast<IOpenApiAny>()
+                    .ToList();
+            return null;
+        }
+
+        /// <summary>
+        /// Map a .NET type to JSON schema type.
+        /// </summary>
+        /// <param name="type">The type to be mapped.</param>
+        /// <returns>The mapped type.</returns>
+        // private static string GetType(Type type)
+        // {
+        //     if (type == null)
+        //     {
+        //         return null;
+        //     }
+        //
+        //     Type actualType = IsNullable(type) ? Nullable.GetUnderlyingType(type) : type;
+        //
+        //     if (actualType == typeof(int) || actualType == typeof(long) || actualType == typeof(short) || actualType == typeof(byte) || actualType == typeof(sbyte) || actualType == typeof(ushort) || actualType == typeof(ulong))
+        //     {
+        //         return "integer";
+        //     }
+        //     else if (actualType == typeof(float) || actualType == typeof(double) || actualType == typeof(decimal))
+        //     {
+        //         return "number";
+        //     }
+        //     else if (actualType == typeof(string) || actualType == typeof(DateTime) || actualType == typeof(Stream) || actualType == typeof(Guid) || actualType == typeof(DateTimeOffset) || actualType == typeof(char))
+        //     {
+        //         return "string";
+        //     }
+        //     else if (actualType == typeof(bool))
+        //     {
+        //         return "boolean";
+        //     }
+        //
+        //     return null;
+        // }
+
+        /// <summary>
+        ///     Determines the type kind of the given property type.
+        /// </summary>
+        /// <param name="type"></param>
+        /// <param name="actualType">
+        ///     When this method returns, contains the actual type of type is a
+        ///     nullable type, an enumerable type, an array type, or an interface type; otherwise, null. This parameter is passed
+        ///     uninitialized.
+        /// </param>
+        /// <returns>The <see cref="TypeKind" /> of the property type.</returns>
+        private static TypeKind GetTypeKind(Type type, out Type actualType)
+        {
+            if (TryGetUnderlyingNullableType(type, out var underlyingType))
+                if (Attribute.GetCustomAttribute(underlyingType, typeof(DataContractAttribute)) is DataContractAttribute
+                    dataContractAttribute)
+                {
+                    actualType = underlyingType;
+                    return TypeKind.UnderlyingType;
+                }
+
+            var arrayType = type.GetElementType();
+            var enumerableType = type.GetInterface("IEnumerable") != null && type != typeof(string)
+                ? type.GetGenericArguments().FirstOrDefault()
+                : null;
+
+            if (enumerableType != null)
+            {
+                actualType = enumerableType;
+                return TypeKind.EnumerableType;
+            }
+
+            if (arrayType != null)
+            {
+                actualType = arrayType;
+                return TypeKind.ArrayType;
+            }
+
+            if (type.IsInterface)
+            {
+                actualType = type;
+                return TypeKind.InterfaceType;
+            }
+
+            if (type.BaseType != null && type.BaseType.IsArray)
+            {
+                actualType = type.BaseType.GetElementType();
+                return TypeKind.ArrayType;
+            }
+
+            if (type.IsEnum)
+            {
+                actualType = type;
+                return TypeKind.EnumType;
+            }
+
+            if (type.IsPrimitive || type == typeof(string)
+                                 || underlyingType is { IsPrimitive: true } || underlyingType == typeof(string)
+                                 || type == typeof(decimal)
+                                 || underlyingType == typeof(decimal))
+            {
+                actualType = type;
+                return TypeKind.PrimitiveType;
+            }
+
+            // if (type == typeof(DateTime) || type == typeof(DateOnly)
+            //                              || (underlyingType != null && underlyingType == typeof(DateTime)) ||
+            //                              underlyingType == typeof(DateOnly))
+            if (type == typeof(DateTime) || (underlyingType != null && underlyingType == typeof(DateTime)))
+
+            {
+                actualType = underlyingType ?? type;
+                return TypeKind.DateTimeType;
+            }
+
+            actualType = null;
+            return TypeKind.None;
+        }
+
+        private static bool TryGetUnderlyingNullableType(Type type, out Type underlyingType)
+        {
+            if (IsNullable(type))
+            {
+                underlyingType = Nullable.GetUnderlyingType(type);
+                return true;
+            }
+
+            underlyingType = null;
+            return false;
+        }
         /// <summary>
         /// Check if a type is nullable.
         /// </summary>
@@ -1128,3 +1663,1568 @@ namespace CoreWCF.OpenApi
         }
     }
 }
+
+
+
+// using System;
+// using System.Collections;
+// using System.Collections.Generic;
+// using System.ComponentModel;
+// using System.Globalization;
+// using System.Linq;
+// using System.Reflection;
+// using System.Runtime.Serialization;
+// using System.Text.RegularExpressions;
+// using System.Threading.Tasks;
+// using System.Xml;
+// using CoreWCF.Description;
+// using CoreWCF;
+// using CoreWCF.OpenApi;
+// using CoreWCF.OpenApi.Attributes;
+// using CoreWCF.Web;
+// using Microsoft.AspNetCore.WebUtilities;
+// using Microsoft.OpenApi.Any;
+// using Microsoft.OpenApi.Interfaces;
+// using Microsoft.OpenApi.Models;
+//
+// namespace CoreWCF.OpenApi;
+// [Flags]
+// public enum TypeKind
+// {
+//     None = 0,
+//     UnderlyingType = 1,
+//     ArrayType = 2,
+//     EnumerableType = 4,
+//     InterfaceType = 8,
+//     EnumType = 16,
+//     PrimitiveType = 32,
+//     DateTimeType = 64
+// }
+//
+// public static class OpenApiSchemaBuilder
+// {
+//     private const string ArrayNamespace = "http://schemas.microsoft.com/2003/10/Serialization/Arrays";
+//     private const string DataContractNamespace = "http://schemas.datacontract.org/2004/07/";
+//
+//     /// <summary>
+//     ///     Build the OpenAPI specification file.
+//     /// </summary>
+//     /// <param name="info">Top level information about the API.</param>
+//     /// <param name="contracts">One or more service contracts.</param>
+//     /// <returns>An OpenAPI specification file.</returns>
+//     /// <exception cref="ArgumentNullException"></exception>
+//     public static OpenApiDocument BuildOpenApiSpecificationDocument(OpenApiOptions info,
+//         IEnumerable<OpenApiContractInfo> contracts)
+//     {
+//         if (info == null) throw new ArgumentNullException(nameof(info));
+//
+//         if (contracts == null) throw new ArgumentNullException(nameof(contracts));
+//
+//         var document = new OpenApiDocument
+//         {
+//             Components = new OpenApiComponents(),
+//             Paths = new OpenApiPaths()
+//         };
+//
+//         PopulateOpenApiInfo(document, info);
+//         //TODO prevent possible multiple enumerations
+//         //TODO start point of custom type mappings
+//         PopulateOpenApiPathsOperations(document, contracts.ToList(), info.TagsToHide.ToList(), info.CustomTypeMappings);
+//
+//         if (info.TagsSorter != null)
+//         {
+//             var tags = document.Tags as List<OpenApiTag> ?? document.Tags.ToList();
+//             tags.Sort(info.TagsSorter);
+//             document.Tags = tags;
+//         }
+//
+//         return document;
+//     }
+//
+//     /// <summary>
+//     ///     Populate some top level general info about the API.
+//     /// </summary>
+//     /// <param name="document">The document object that is being built up.</param>
+//     /// <param name="info">Top level information about the API.</param>
+//     private static void PopulateOpenApiInfo(OpenApiDocument document, OpenApiOptions info)
+//     {
+//         document.Info = new OpenApiInfo
+//         {
+//             Version = info.Version ?? "",
+//             Description = info.Description,
+//             Title = info.Title ?? "",
+//             TermsOfService = info.TermsOfService
+//         };
+//
+//         if (info.ContactName != null || info.ContactEmail != null || info.ContactUrl != null)
+//             document.Info.Contact = new OpenApiContact
+//             {
+//                 Name = info.ContactName,
+//                 Email = info.ContactEmail,
+//                 Url = info.ContactUrl
+//             };
+//
+//         if (info.LicenseName != null)
+//             document.Info.License = new OpenApiLicense
+//             {
+//                 Name = info.LicenseName,
+//                 Url = info.LiceneUrl
+//             };
+//
+//         if (info.ExternalDocumentUrl != null)
+//             document.ExternalDocs = new OpenApiExternalDocs
+//             {
+//                 Description = info.ExternalDocumentDescription,
+//                 Url = info.ExternalDocumentUrl
+//             };
+//     }
+//
+//     /// <summary>
+//     ///     Populate the paths and operations from a given API.
+//     /// </summary>
+//     /// <param name="document">The document object that is being built up.</param>
+//     /// <param name="contracts">The WCF contracts that should be documented.</param>
+//     /// <param name="tagsToHide">Any tags that need to be hidden for some reason.</param>
+//     /// <param name="customTypeMappings"></param>
+//     private static void PopulateOpenApiPathsOperations(OpenApiDocument document, List<OpenApiContractInfo> contracts,
+//         List<string> tagsToHide, IReadOnlyDictionary<Type, Func<OpenApiSchema>> customTypeMappings)
+//     {
+//         foreach (var contractInfo in contracts)
+//         {
+//             var methods = new List<MethodInfo>();
+//             foreach (var interfaceInfo in contractInfo.Contract.GetInterfaces())
+//                 methods.AddRange(interfaceInfo.GetMethods());
+//
+//             methods.AddRange(contractInfo.Contract.GetMethods());
+//
+//             var basePathAttribute =
+//                 contractInfo.Contract.GetCustomAttribute<OpenApiBasePathAttribute>();
+//
+//             foreach (var method in methods)
+//             {
+//                 PopulateOpenApiPath(
+//                     document,
+//                     method,
+//                     tagsToHide,
+//                     basePathAttribute?.BasePath,
+//                     contractInfo.ResponseFormat,
+//                     GetMethodUriWebGet,
+//                     customTypeMappings);
+//
+//                 PopulateOpenApiPath(
+//                     document,
+//                     method,
+//                     tagsToHide,
+//                     basePathAttribute?.BasePath,
+//                     contractInfo.ResponseFormat,
+//                     GetMethodUriWebInvoke,
+//                     customTypeMappings);
+//             }
+//         }
+//     }
+//
+//     /// <summary>
+//     ///     Populate a path that uses a from a given method.
+//     /// </summary>
+//     /// <param name="document">The document object that is being built up.</param>
+//     /// <param name="methodInfo">The given method.</param>
+//     /// <param name="tagsToHide">Any tags that need to be hidden for some reason.</param>
+//     /// <param name="additionalBasePath">An additional base path a given service contract is registered under.</param>
+//     /// <param name="behaviorFormat">The default format in the WebHttpBehavior.</param>
+//     /// <param name="getOperationInfo">Get necessary information about an operation.</param>
+//     /// <param name="customTypeMappings"></param>
+//     private static void PopulateOpenApiPath(OpenApiDocument document,
+//         MethodInfo methodInfo,
+//         List<string> tagsToHide,
+//         string additionalBasePath,
+//         WebMessageFormat behaviorFormat,
+//         Func<MethodInfo, OperationInfo> getOperationInfo,
+//         IReadOnlyDictionary<Type, Func<OpenApiSchema>> customTypeMappings)
+//     {
+//         var operationInfo = getOperationInfo(methodInfo);
+//         if (operationInfo.Method == null || operationInfo.UriTemplate == null)
+//             return;
+//
+//         if (methodInfo.GetCustomAttribute<OpenApiHiddenAttribute>() != null)
+//             return;
+//
+//         foreach (var tagAttribute in methodInfo.GetCustomAttributes<OpenApiTagAttribute>())
+//             if (tagsToHide.Contains(tagAttribute.Tag))
+//                 return;
+//
+//         var operation = new OpenApiOperation();
+//
+//         var uri = Regex.Replace(operationInfo.UriTemplate, @"\?.*", "");
+//
+//         if (!string.IsNullOrEmpty(additionalBasePath))
+//             uri = additionalBasePath + uri;
+//
+//         var defaultContentType = new DefaultContentType
+//         {
+//             ResponseFormatExplicitlySet = operationInfo.IsResponseFormatSetExplicitly,
+//             ResponseAttributeFormat = operationInfo.ResponseFormat,
+//             ResponseBehaviorFormat = behaviorFormat,
+//             //TODO These properties are likely used later in the code to determine how to format the request of an operation.
+//             RequestFormatExplicitlySet = operationInfo.IsRequestFormatSetExplicitly,
+//             RequestAttributeFormat = operationInfo.RequestFormat
+//         };
+//
+//         var table = new NameTable();
+//         var nsManager = new XmlNamespaceManager(table);
+//
+//         PopulateOpenApiResponses(document, operation, methodInfo, defaultContentType, tagsToHide, nsManager,
+//             customTypeMappings);
+//         PopulateOpenApiParameters(document, operation, methodInfo, operationInfo.UriTemplate, defaultContentType,
+//             tagsToHide, nsManager, customTypeMappings);
+//         PopulateOpenApiOperationTags(document, operation, methodInfo);
+//         PopulateOpenApiOperationSummary(operation, methodInfo);
+//
+//         var operationType = GetOperationType(operationInfo.Method);
+//         if (operationType.HasValue && document.Paths.ContainsKey(uri))
+//         {
+//             if (!document.Paths[uri].Operations.ContainsKey(operationType.Value))
+//                 document.Paths[uri].Operations.Add(operationType.Value, operation);
+//         }
+//         else if (operationType.HasValue)
+//         {
+//             document.Paths.Add(uri, new OpenApiPathItem
+//             {
+//                 Operations = new Dictionary<OperationType, OpenApiOperation>
+//                 {
+//                     {operationType.Value, operation}
+//                 }
+//             });
+//         }
+//     }
+//
+//     /// <summary>
+//     ///     Maps an HTTP method to an OperationType.
+//     /// </summary>
+//     /// <param name="method">An HTTP method.</param>
+//     /// <returns>An OperationType.</returns>
+//     private static OperationType? GetOperationType(string method)
+//     {
+//         switch (method.ToLower())
+//         {
+//             case "get":
+//                 return OperationType.Get;
+//             case "put":
+//                 return OperationType.Put;
+//             case "post":
+//                 return OperationType.Post;
+//             case "delete":
+//                 return OperationType.Delete;
+//             case "options":
+//                 return OperationType.Options;
+//             case "head":
+//                 return OperationType.Head;
+//             case "patch":
+//                 return OperationType.Patch;
+//             case "trace":
+//                 return OperationType.Trace;
+//             default:
+//                 return null;
+//         }
+//     }
+//
+//     /// <summary>
+//     ///     Get the method and URI for a service contract method with a WebGetAttribute.
+//     /// </summary>
+//     /// <param name="methodInfo">A method in a service contract.</param>
+//     /// <returns>An HTTP method and URI.</returns>
+//     private static OperationInfo GetMethodUriWebGet(MethodInfo methodInfo)
+//     {
+//         var attribute = methodInfo.GetCustomAttribute<WebGetAttribute>()
+//                         ?? WebHttpServiceModelCompat.GetNativeAttribute<WebGetAttribute>(methodInfo);
+//
+//         if (attribute == null) return new OperationInfo();
+//
+//         return new OperationInfo
+//         {
+//             Method = "get",
+//             UriTemplate = attribute.UriTemplate,
+//             IsResponseFormatSetExplicitly = attribute.IsResponseFormatSetExplicitly,
+//             ResponseFormat = attribute.ResponseFormat,
+//             IsRequestFormatSetExplicitly = attribute.IsRequestFormatSetExplicitly,
+//             RequestFormat = attribute.RequestFormat
+//         };
+//     }
+//
+//     /// <summary>
+//     ///     Get the method and URI for a service contract method with a WebInvokeAttribute.
+//     /// </summary>
+//     /// <param name="methodInfo">A method in a service contract.</param>
+//     /// <returns>An HTTP method and URI.</returns>
+//     private static OperationInfo GetMethodUriWebInvoke(MethodInfo methodInfo)
+//     {
+//         var attribute = methodInfo.GetCustomAttribute<WebInvokeAttribute>()
+//                         ?? WebHttpServiceModelCompat.GetNativeAttribute<WebInvokeAttribute>(methodInfo);
+//
+//         if (attribute == null) return new OperationInfo();
+//
+//         return new OperationInfo
+//         {
+//             Method = attribute.Method?.ToLower(CultureInfo.InvariantCulture),
+//             UriTemplate = attribute.UriTemplate,
+//             IsResponseFormatSetExplicitly = attribute.IsResponseFormatSetExplicitly,
+//             ResponseFormat = attribute.ResponseFormat,
+//             IsRequestFormatSetExplicitly = attribute.IsRequestFormatSetExplicitly,
+//             RequestFormat = attribute.RequestFormat
+//         };
+//     }
+//
+//     /// <summary>
+//     ///     Populate the responses for a given method.
+//     /// </summary>
+//     /// <param name="document">The document object that is being built up.</param>
+//     /// <param name="operation">The schema object that is being built up.</param>
+//     /// <param name="method">The given method.</param>
+//     /// <param name="defaultContentType">Calculates the default content type.</param>
+//     /// <param name="tagsToHide">Any tags that need to be hidden for some reason.</param>
+//     /// <param name="nsManager"></param>
+//     /// <param name="customTypeMappings"></param>
+//     private static void PopulateOpenApiResponses(OpenApiDocument document,
+//         OpenApiOperation operation,
+//         MethodInfo method,
+//         DefaultContentType defaultContentType,
+//         List<string> tagsToHide,
+//         XmlNamespaceManager nsManager,
+//         IReadOnlyDictionary<Type, Func<OpenApiSchema>> customTypeMappings)
+//     {
+//         //TODO prevent possible multiple enumeration
+//         var attributes = method.GetCustomAttributes<OpenApiResponseAttribute>().ToList();
+//         if (attributes.Any())
+//         {
+//             foreach (var responseAttribute in attributes)
+//                 PopulateOpenApiResponse(
+//                     responseAttribute.Type ?? method.ReturnType,
+//                     document,
+//                     operation,
+//                     defaultContentType,
+//                     tagsToHide,
+//                     nsManager,
+//                     customTypeMappings,
+//                     responseAttribute);
+//         }
+//         //TODO method.ReturnType != null always return true even 'void' 
+//         else if (method.ReturnType != typeof(Task))
+//         {
+//             var type = method.ReturnType;
+//             if (type.IsGenericType && type.GetGenericTypeDefinition() == typeof(Task<>))
+//                 type = type.GetGenericArguments()[0];
+//
+//             PopulateOpenApiResponse(
+//                 type,
+//                 document,
+//                 operation,
+//                 defaultContentType,
+//                 tagsToHide,
+//                 nsManager,
+//                 customTypeMappings);
+//         }
+//     }
+//
+//     /// <summary>
+//     ///     Populate a response for a given method.
+//     /// </summary>
+//     /// <param name="type">The type of the response.</param>
+//     /// <param name="document">The document object that is being built up.</param>
+//     /// <param name="operation">The schema object that is being built up.</param>
+//     /// <param name="defaultContentType">Calculates the default content type.</param>
+//     /// <param name="tagsToHide">Any tags that need to be hidden for some reason.</param>
+//     /// <param name="nsManager">XmlNamespaceManager instance.</param>
+//     /// <param name="customTypeMappings"></param>
+//     /// <param name="responseAttribute">Open API metadata for a response.</param>
+//     private static void PopulateOpenApiResponse(Type type, OpenApiDocument document, OpenApiOperation operation,
+//         DefaultContentType defaultContentType,
+//         List<string> tagsToHide, XmlNamespaceManager nsManager,
+//         IReadOnlyDictionary<Type, Func<OpenApiSchema>> customTypeMappings,
+//         OpenApiResponseAttribute responseAttribute = null)
+//     {
+//         //TODO Response
+//         OpenApiSchema schemaSchema;
+//         if (type == null)
+//         {
+//             schemaSchema = null;
+//         }
+//         else
+//         {
+//             var dataContractAttribute = type.GetCustomAttribute<DataContractAttribute>();
+//             //TODO The starting point of changing, using only the DataContractAttribute name and namespace properties, is as follows:
+//             if (dataContractAttribute != null)
+//             {
+//                 PopulateOpenApiSchema(document, type, tagsToHide, nsManager, customTypeMappings);
+//                 var schemaId = GetSchemaId(type, dataContractAttribute, null);
+//                 schemaSchema = GetOpenApiSchema(type, schemaId);
+//             }
+//             else if (TryGetDataContractAttribute(type, out var elementType))
+//             {
+//                 PopulateOpenApiSchema(document, type, tagsToHide, nsManager, customTypeMappings);
+//                 var schemaId = GetSchemaId(type, null, elementType);
+//                 schemaSchema = GetOpenApiSchema(type, schemaId);
+//             }
+//             else
+//             {
+//                 schemaSchema = new OpenApiSchema
+//                 {
+//                     Type = GetJSONSchemaType(type),
+//                     Format = GetFormatType(type)
+//                 };
+//             }
+//         }
+//
+//         OpenApiResponse response = new() { Description = responseAttribute?.Description };
+//
+//         if (responseAttribute?.ContentTypes != null)
+//             response.Content = responseAttribute.ContentTypes.ToDictionary(contentType => contentType,
+//                 _ => new OpenApiMediaType { Schema = schemaSchema });
+//         else if (schemaSchema != null)
+//             response.Content = defaultContentType.GetContentTypes(true).ToDictionary(contentType => contentType,
+//                 _ => new OpenApiMediaType { Schema = schemaSchema });
+//
+//         var statusCode = responseAttribute?.StatusCode == null ? 200 : (int)responseAttribute.StatusCode;
+//         operation.Responses.Add(statusCode.ToString(CultureInfo.InvariantCulture), response);
+//     }
+//
+//     /// <summary>
+//     ///     Tries to get the <see cref="DataContractAttribute" /> for the specified <paramref name="type" /> and returns the
+//     ///     element type if it exists.
+//     /// </summary>
+//     /// <param name="type">The type to inspect for the DataContractAttribute.</param>
+//     /// <param name="elementType">
+//     ///     When this method returns, contains the element type if the DataContractAttribute is found;
+//     ///     otherwise, null. This parameter is passed uninitialized.
+//     /// </param>
+//     /// <returns>true if the DataContractAttribute is found; otherwise, false.</returns>
+//     private static bool TryGetDataContractAttribute(Type type, out Type elementType)
+//     {
+//         elementType = null;
+//         //TODO check other cases (return method type is Interface or Enums or ...)
+//         if (!typeof(IEnumerable).IsAssignableFrom(type) || type == typeof(string)) return false;
+//         if (type.IsGenericType)
+//         {
+//             elementType = type.GetGenericArguments()[0];
+//             return elementType.GetCustomAttribute<DataContractAttribute>() != null;
+//         }
+//
+//         elementType = type.GetElementType();
+//         return elementType?.GetCustomAttribute<DataContractAttribute>() != null;
+//     }
+//
+//     /// <summary>
+//     ///     Generates a unique identifier for the schema based on the provided type, data contract attribute, and element type.
+//     /// </summary>
+//     /// <param name="type">The type for which the schema ID is being generated.</param>
+//     /// <param name="dataContractAttribute">The data contract attribute associated with the type.</param>
+//     /// <param name="elementType">The element type associated with the type, if any.</param>
+//     /// <returns>A string representing the unique schema ID.</returns>
+//     private static string GetSchemaId(Type type, DataContractAttribute dataContractAttribute, Type elementType)
+//     {
+//         if (dataContractAttribute?.Name != null) return dataContractAttribute.Name;
+//
+//         if (elementType != null) return $"{elementType.Namespace}.{elementType.Name}";
+//
+//         return type.IsArray ? $"{type.Namespace}.{type.GetElementType()?.Name}" : $"{type.Namespace}.{type.Name}";
+//     }
+//
+//     /// <summary>
+//     ///     Generates an OpenApiSchema for a given type and schema ID.
+//     /// </summary>
+//     /// <param name="type">The type for which the OpenApiSchema is to be generated.</param>
+//     /// <param name="schemaId">The ID of the schema.</param>
+//     /// <returns>An OpenApiSchema object that represents the given type and schema ID.</returns>
+//     private static OpenApiSchema GetOpenApiSchema(Type type, string schemaId)
+//     {
+//         return type.IsArray || (type.IsGenericType && type.GetGenericTypeDefinition() == typeof(List<>))
+//             ? new OpenApiSchema
+//             {
+//                 Type = GetJSONSchemaType(type),
+//                 Items = new OpenApiSchema
+//                 {
+//                     Reference = new OpenApiReference
+//                     {
+//                         Type = ReferenceType.Schema,
+//                         Id = schemaId
+//                     }
+//                 }
+//             }
+//             : new OpenApiSchema
+//             {
+//                 Reference = new OpenApiReference
+//                 {
+//                     Type = ReferenceType.Schema,
+//                     Id = schemaId
+//                 }
+//             };
+//     }
+//
+//     /// <summary>
+//     ///     Populate the parameters for a given method.
+//     /// </summary>
+//     /// <param name="document">The document object that is being built up.</param>
+//     /// <param name="operation">The schema object that is being built up.</param>
+//     /// <param name="method">The given method.</param>
+//     /// <param name="uriTemplateRaw">The uri template for the method.</param>
+//     /// <param name="defaultContentType">Calculates the default content type.</param>
+//     /// <param name="tagsToHide">Any tags that need to be hidden for some reason.</param>
+//     /// <param name="nsManager">XmlNamespaceManager instance.</param>
+//     /// <param name="customTypeMappings"></param>
+//     private static void PopulateOpenApiParameters(OpenApiDocument document,
+//         OpenApiOperation operation,
+//         MethodInfo method,
+//         string uriTemplateRaw,
+//         DefaultContentType defaultContentType,
+//         IEnumerable<string> tagsToHide,
+//         XmlNamespaceManager nsManager, IReadOnlyDictionary<Type, Func<OpenApiSchema>> customTypeMappings)
+//     {
+//         //TODO prevent possible multiple enumerations
+//         var toHide = tagsToHide.ToList();
+//         //get method name 
+//         var methodName = method.Name;
+//         foreach (var parameter in method.GetParameters())
+//         {
+//             if (operation.Parameters == null) operation.Parameters = new List<OpenApiParameter>();
+//
+//             var attribute = parameter.GetCustomAttribute<OpenApiParameterAttribute>();
+//
+//             var isHidden = false;
+//             foreach (var tagAttribute in parameter.GetCustomAttributes<OpenApiTagAttribute>())
+//                 if (toHide.Contains(tagAttribute.Tag))
+//                     isHidden = true;
+//
+//             var hiddenAttribute = parameter.GetCustomAttribute<OpenApiHiddenAttribute>();
+//
+//             if (isHidden || hiddenAttribute != null) continue;
+//
+//             var uriTemplate = new UriTemplate(uriTemplateRaw);
+//             ParameterLocation? parameterLocation = null;
+//             if (uriTemplate.PathSegmentVariableNames.Any(variableName =>
+//                     string.Equals(variableName, parameter.Name, StringComparison.OrdinalIgnoreCase)))
+//                 parameterLocation = ParameterLocation.Path;
+//             else if (uriTemplate.QueryValueVariableNames.Any(variableName =>
+//                          string.Equals(variableName, parameter.Name, StringComparison.OrdinalIgnoreCase)))
+//                 parameterLocation = ParameterLocation.Query;
+//
+//             var queryString =
+//                 QueryHelpers.ParseQuery(new Uri("http://microsoft.com" + uriTemplateRaw).Query);
+//             var name = parameter.Name;
+//             if (parameterLocation == ParameterLocation.Query && queryString.ContainsValue("{" + parameter.Name + "}"))
+//             {
+//                 var queryStringParameter =
+//                     queryString.First(kvp => kvp.Value == "{" + parameter.Name + "}");
+//                 name = queryStringParameter.Key;
+//             }
+//
+//             //TODO if parameterType is List ???
+//             var actualType = parameter.ParameterType.IsArray
+//                 ? parameter.ParameterType.GetElementType()
+//                 : parameter.ParameterType;
+//
+//             var dataContractAttribute = actualType.GetCustomAttribute<DataContractAttribute>();
+//             if (parameterLocation == null)
+//             {
+//                 OpenApiMediaType content;
+//                 if (dataContractAttribute != null)
+//                 {
+//                     //TODO
+//                     PopulateOpenApiSchema(document, actualType, toHide, nsManager, customTypeMappings);
+//                     // PopulateOpenApiSchema(document, actualType, toHide, nsManager, customTypeMappings);
+//                     //TODO if method parameter is reference array with datacontract attribute
+//                     if (parameter.ParameterType.IsArray)
+//                         content = new OpenApiMediaType
+//                         {
+//                             Schema = new OpenApiSchema
+//                             {
+//                                 Type = "array",
+//                                 Items = new OpenApiSchema
+//                                 {
+//                                     Reference = new OpenApiReference
+//                                     {
+//                                         Type = ReferenceType.Schema,
+//                                         Id
+//                                             // Id = GetSchemaKey(innerDataMemberAttribute, innerDataMemberAttribute, true),
+//                                             = dataContractAttribute?.Name ?? actualType.FullName
+//                                     },
+//                                     Xml = new OpenApiXml
+//                                     {
+//                                         Namespace = new Uri(ArrayNamespace),
+//                                         //TODO
+//                                         // Name = innerDataMemberAttribute.Name,
+//                                         Name = actualType.Name,
+//                                         Prefix = FindPrefix(nsManager, ArrayNamespace)
+//                                     }
+//                                 }
+//                             }
+//                         };
+//                     else
+//                         content = new OpenApiMediaType
+//                         {
+//                             Schema = new OpenApiSchema
+//                             {
+//                                 Reference = new OpenApiReference
+//                                 {
+//                                     Type = ReferenceType.Schema,
+//                                     Id = dataContractAttribute?.Name ?? actualType.FullName
+//                                 }
+//                             }
+//                         };
+//                 }
+//                 else
+//                 {
+//                     content = new OpenApiMediaType
+//                     {
+//                         Schema = new OpenApiSchema
+//                         {
+//                             Type = GetJSONSchemaType(actualType),
+//                             Format = GetFormatType(actualType)
+//                         }
+//                     };
+//                 }
+//
+//                 if (attribute?.ContentTypes != null)
+//                     operation.RequestBody = new OpenApiRequestBody
+//                     {
+//                         Content = attribute.ContentTypes.ToDictionary(contentType => contentType, _ => content),
+//                         Required = !parameter.IsOptional,
+//                         Description = attribute?.Description
+//                     };
+//                 else
+//                     operation.RequestBody = new OpenApiRequestBody
+//                     {
+//                         //TODO
+//                         Content = defaultContentType.GetContentTypes(false)
+//                             .ToDictionary(contentType => contentType, _ => content),
+//                         Required = !parameter.IsOptional,
+//                         Description = attribute?.Description
+//                     };
+//             }
+//             else
+//             {
+//                 //TODO
+//                 operation.Parameters.Add(new OpenApiParameter
+//                 {
+//                     Name = name,
+//                     Description = attribute?.Description,
+//                     Schema = new OpenApiSchema
+//                     {
+//                         Type = GetJSONSchemaType(actualType),
+//                         // Format = enums != null ? "enum" : null,
+//                         Format = GetFormatType(actualType),
+//                         Enum = GetEnumValuesAsOpenApiStrings(actualType)
+//                     },
+//                     In = parameterLocation,
+//                     Required = !parameter.IsOptional || parameterLocation == ParameterLocation.Path
+//                 });
+//             }
+//         }
+//     }
+//
+//     /// <summary>
+//     ///     Populate the tags for a given method.
+//     /// </summary>
+//     /// <param name="document">The document object that is being built up.</param>
+//     /// <param name="operation">The operation object that is being built up.</param>
+//     /// <param name="method">The given method.</param>
+//     private static void PopulateOpenApiOperationTags(OpenApiDocument document, OpenApiOperation operation,
+//         MethodInfo method)
+//     {
+//         foreach (var attribute in method.GetCustomAttributes<OpenApiTagAttribute>())
+//         {
+//             if (operation.Tags == null) operation.Tags = new List<OpenApiTag>();
+//
+//             operation.Tags.Add(new OpenApiTag { Name = attribute.Tag });
+//
+//             if (document.Tags.All(existingTag => existingTag.Name != attribute.Tag))
+//                 document.Tags.Add(new OpenApiTag
+//                 {
+//                     Name = attribute.Tag
+//                 });
+//         }
+//     }
+//
+//     /// <summary>
+//     ///     Populate the operations summary for a given method.
+//     /// </summary>
+//     /// <param name="operation">The schema object that is being built up.</param>
+//     /// <param name="method">The given method.</param>
+//     private static void PopulateOpenApiOperationSummary(OpenApiOperation operation, MethodInfo method)
+//     {
+//         var operationSummaryAttribute = method.GetCustomAttribute<OpenApiOperationAttribute>();
+//         if (operationSummaryAttribute != null)
+//         {
+//             operation.Summary = operationSummaryAttribute.Summary;
+//             operation.Description = operationSummaryAttribute.Description;
+//         }
+//
+//         //TODO
+//         if (method.GetCustomAttribute<ObsoleteAttribute>() != null) operation.Deprecated = true;
+//     }
+//
+//     /// <summary>
+//     ///     Populate a schema from a given type.
+//     /// </summary>
+//     /// <param name="document">The document object that is being built up.</param>
+//     /// <param name="definition">The given type.</param>
+//     /// <param name="tagsToHide">Any tags that need to be hidden for some reason.</param>
+//     /// <param name="nsManager">XmlNamespaceManager instance.</param>
+//     /// <param name="customTypeMappings"></param>
+//     private static void PopulateOpenApiSchema(OpenApiDocument document, Type definition, List<string> tagsToHide,
+//         XmlNamespaceManager nsManager, IReadOnlyDictionary<Type, Func<OpenApiSchema>> customTypeMappings)
+//     {
+//         var seenKeys = new HashSet<string>();
+//         var queue = new Queue<(Type parent, Type type, bool isInArray)>();
+//
+//         var realDefinitionType = definition.IsArray
+//             ? definition.GetElementType() ?? definition.GetGenericArguments()[0]
+//             : definition;
+//
+//         if (IsContractAndIsNewContract(null, realDefinitionType, seenKeys, definition.IsArray))
+//             queue.Enqueue((null, realDefinitionType, definition.IsArray));
+//
+//         while (queue.Any())
+//         {
+//             var (parent, type, isInArray) = queue.Dequeue();
+//             var name = type.Name;
+//             AddTypeToSchemas(document, parent, type, isInArray, tagsToHide, nsManager, customTypeMappings);
+//
+//             foreach (var property in type.GetProperties())
+//             {
+//                 var propertyTypeKind = GetTypeKind(property.PropertyType, out var actualType);
+//
+//                 if (!IsDataMemberProperty(property))
+//                     continue;
+//
+//                 switch (propertyTypeKind)
+//                 {
+//                     case TypeKind.UnderlyingType:
+//                     case TypeKind.EnumType:
+//                         if (IsContractAndIsNewContract(type, actualType, seenKeys, actualType.IsArray))
+//                             queue.Enqueue((type, actualType, actualType.IsArray));
+//                         break;
+//                     case TypeKind.EnumerableType:
+//                     case TypeKind.ArrayType:
+//                         var test = property.PropertyType.GetGenericArguments().FirstOrDefault();
+//                         var isGenericList = property.PropertyType.IsArray || (property.PropertyType.IsGenericType &&
+//                                                                               property.PropertyType
+//                                                                                   .GetGenericTypeDefinition() ==
+//                                                                               typeof(List<>));
+//                         if (IsContractAndIsNewContract(type, actualType, seenKeys, isGenericList))
+//                             queue.Enqueue((type, actualType, isGenericList));
+//                         break;
+//                     case TypeKind.InterfaceType:
+//                         ProcessInterfaceProperty(document, type, property, customTypeMappings);
+//                         break;
+//                     case TypeKind.None:
+//                         if (IsContractAndIsNewContract(type, property.PropertyType, seenKeys,
+//                                 property.PropertyType.IsArray))
+//                             queue.Enqueue((type, property.PropertyType, property.PropertyType.IsArray));
+//                         break;
+//                 }
+//             }
+//         }
+//     }
+//
+//     private static bool IsDataMemberProperty(PropertyInfo property)
+//     {
+//         return property.GetCustomAttribute<DataMemberAttribute>() != null;
+//     }
+//
+//     private static bool IsContractAndIsNewContract(Type parent, Type type, HashSet<string> seenKeys, bool isInArray)
+//     {
+//         var parentDataContractAttribute = parent?.GetCustomAttribute<DataContractAttribute>();
+//         var dataContractAttribute = type.GetCustomAttribute<DataContractAttribute>();
+//         if (dataContractAttribute == null) return false;
+//         //TODO We remain on the scenario of ‘DataContract’ name and namespace usage, but add the schema name (by type.Name) when they are missing.
+//         var schemaKey = GetSchemaKey(parentDataContractAttribute, dataContractAttribute, type, isInArray);
+//         if (seenKeys.Contains(schemaKey)) return false;
+//
+//         seenKeys.Add(schemaKey);
+//         return true;
+//     }
+//
+//     private static void ProcessInterfaceProperty(OpenApiDocument document, Type type, PropertyInfo property,
+//         IReadOnlyDictionary<Type, Func<OpenApiSchema>> customTypeMappings)
+//     {
+//         var typeName = type.Name;
+//         var propertyName = property.Name;
+//         var schemaKey = GetSchemaKey(null, null, property.PropertyType, false);
+//         if (document.Components.Schemas.TryGetValue(schemaKey, out var existInterfaceSchema))
+//         {
+//             var underlyingTypes = type.GetCustomAttributes<KnownTypeAttribute>().ToList();
+//             var knownTypesSchemas = new List<OpenApiSchema>();
+//
+//             foreach (var knownTypeAttribute in underlyingTypes)
+//                 if (knownTypeAttribute.Type != null &&
+//                     customTypeMappings.TryGetValue(knownTypeAttribute.Type, out var customTypeSchema))
+//                     knownTypesSchemas.Add(customTypeSchema());
+//
+//             existInterfaceSchema.Properties.Add(property.Name,
+//                 new OpenApiSchema
+//                 {
+//                     Type = "object",
+//                     OneOf = knownTypesSchemas
+//                 });
+//         }
+//     }
+//
+//     //TODO make a working variant when DataContract has a name and namespace
+//     /// <summary>
+//     ///     Get the type to store a schema under.
+//     /// </summary>
+//     /// <param name="parentDataContractAttribute">The data contract attribute for the parent of the type to add.</param>
+//     /// <param name="dataContractAttribute">
+//     ///     The data contract attribute for the type to add.
+//     ///     Whether the type is wrapped in an array or not.
+//     /// </param>
+//     /// <param name="type"></param>
+//     /// <param name="isInArray"></param>
+//     /// <returns>The key to store the schema under.</returns>
+//     private static string GetSchemaKey(DataContractAttribute parentDataContractAttribute,
+//         DataContractAttribute dataContractAttribute, Type type, bool isInArray)
+//     {
+//         string keySchema = "";
+//         if (parentDataContractAttribute?.Name != null && isInArray)
+//             keySchema = $"{parentDataContractAttribute.Name}-Array-{dataContractAttribute?.Name}";
+//         else if (parentDataContractAttribute?.Name != null)
+//             keySchema = $"{parentDataContractAttribute.Name}-{dataContractAttribute?.Name}";
+//         else if (type?.Name != null) keySchema = $"{type?.Namespace}.{type?.Name}";
+//
+//         return keySchema;
+//     }
+//
+//     /// <summary>
+//     ///     Add a specific definition to the schemas section.
+//     /// </summary>
+//     /// <param name="document">The document object that is being built up.</param>
+//     /// <param name="parent">The parent of the type to add.</param>
+//     /// <param name="type">The type to add.</param>
+//     /// <param name="isInArray">Whether the type is in an array.</param>
+//     /// <param name="tagsToHide">Any tags that need to be hidden for some reason.</param>
+//     /// <param name="nsManager">XmlNamespaceManager instance.</param>
+//     /// <param name="customTypeMappings"></param>
+//     private static void AddTypeToSchemas(OpenApiDocument document, Type parent, Type type, bool isInArray,
+//         List<string> tagsToHide, XmlNamespaceManager nsManager,
+//         IReadOnlyDictionary<Type, Func<OpenApiSchema>> customTypeMappings)
+//     {
+//         var parentDataContractAttribute = parent?.GetCustomAttribute<DataContractAttribute>();
+//         var dataContractAttribute = type.GetCustomAttribute<DataContractAttribute>();
+//
+//         //TODO We remain on the scenario of ‘DataContract’ namespace usage, but add type or parent namespace when it's missing.
+//         // string parentNs = FindNamespace(parent?.Namespace ?? type.Namespace, parent ?? type);
+//         var parentNs =
+//             FindNamespace(
+//                 parentDataContractAttribute != null
+//                     ? parentDataContractAttribute.Namespace
+//                     : dataContractAttribute?.Namespace ?? parent?.Namespace, parent ?? type);
+//         var parentPrefix = FindPrefix(nsManager, parentNs);
+//
+//         var ns = FindNamespace(dataContractAttribute?.Namespace ?? type.Namespace, type);
+//         var prefix = FindPrefix(nsManager, ns);
+//
+//         var xmlBlock = isInArray
+//             ? new Dictionary<string, IOpenApiExtension>
+//             {
+//                 {
+//                     "xml", new OpenApiObject
+//                     {
+//                         {"name", new OpenApiString(dataContractAttribute?.Name ?? type.Name)},
+//                         {"namespace", new OpenApiString(ns)},
+//                         {"prefix", new OpenApiString(prefix)}
+//                     }
+//                 }
+//             }
+//             : new Dictionary<string, IOpenApiExtension>
+//             {
+//                 {
+//                     "xml", new OpenApiObject
+//                     {
+//                         {"namespace", new OpenApiString(parentNs)},
+//                         {"prefix", new OpenApiString(parentPrefix)}
+//                     }
+//                 }
+//             };
+//
+//         var required = new SortedSet<string>();
+//
+//         //TODO performing assigned custom mappings
+//         OpenApiSchema definitionSchema;
+//         if (customTypeMappings.TryGetValue(type, out var foundedType))
+//         {
+//             definitionSchema = foundedType();
+//             definitionSchema.Extensions = xmlBlock;
+//         }
+//         //TODO performing Enum processing if type is enum with assigned DataContractAttribute
+//         else if (type.IsEnum)
+//         {
+//             definitionSchema = new OpenApiSchema
+//             {
+//                 Type = GetJSONSchemaType(type),
+//                 Format = GetFormatType(type),
+//                 // Format = "enum",
+//                 Description = type.GetCustomAttribute<DescriptionAttribute>()?.Description,
+//                 Enum = GetEnumValuesAsOpenApiStrings(type)
+//             };
+//         }
+//         else
+//         {
+//             definitionSchema = new OpenApiSchema
+//             {
+//                 Type = "object",
+//                 //TODO
+//                 Description = type.GetCustomAttribute<DescriptionAttribute>()?.Description,
+//                 Properties = new Dictionary<string, OpenApiSchema>(),
+//                 Extensions = xmlBlock
+//             };
+//
+//             ProcessTypeAttributes(definitionSchema, parentDataContractAttribute, dataContractAttribute, parent, type,
+//                 tagsToHide, required, nsManager);
+//         }
+//
+//         definitionSchema.Required = required.Count > 0 ? required : null;
+//
+//         document.Components.Schemas.Add(
+//             GetSchemaKey(parentDataContractAttribute, dataContractAttribute, type, isInArray), definitionSchema);
+//         
+//     }
+//
+//
+//     /// <summary>
+//     ///     Processes the attributes of a given type and updates the provided OpenApiSchema definition.
+//     /// </summary>
+//     /// <param name="definitionSchema">The OpenApiSchema definition to be updated.</param>
+//     /// <param name="parentDataContractAttribute">The DataContractAttribute of the parent type.</param>
+//     /// <param name="dataContractAttribute">The DataContractAttribute of the type to be processed.</param>
+//     /// <param name="parent">The parent type of the type to be processed.</param>
+//     /// <param name="type">The type whose attributes are to be processed.</param>
+//     /// <param name="tagsToHide">A list of tags to be hidden.</param>
+//     /// <param name="required">A SortedSet of required properties.</param>
+//     /// <param name="nsManager">The XmlNamespaceManager for managing namespaces.</param>
+//     private static void ProcessTypeAttributes(OpenApiSchema definitionSchema,
+//         DataContractAttribute parentDataContractAttribute, DataContractAttribute dataContractAttribute,
+//         Type parent,
+//         Type type,
+//         List<string> tagsToHide,
+//         SortedSet<string> required,
+//         XmlNamespaceManager nsManager)
+//     {
+//         var properties = type
+//             .GetProperties()
+//             .Select(property => (Property: property,
+//                 DataMemberAttribute: property.GetCustomAttribute<DataMemberAttribute>()))
+//             .Where(property => property.DataMemberAttribute != null || (property is { DataMemberAttribute: not null } &&
+//                                                                         property.Property.GetGetMethod(true)!
+//                                                                             .IsPrivate))
+//             .OrderBy(property => property.DataMemberAttribute.Order).ToList();
+//
+//         if (properties.Any())
+//             ProcessProperties(definitionSchema, parentDataContractAttribute, dataContractAttribute, tagsToHide,
+//                 required, nsManager, properties);
+//         //TODO if you prefer: performing Fields processing
+//     }
+//
+//     /// <summary>
+//     ///     Processes the properties of a given type and adds them to the OpenAPI schema.
+//     /// </summary>
+//     /// <param name="definitionSchema">The OpenAPI schema to which the properties will be added.</param>
+//     /// <param name="parentDataContractAttribute">The DataContract attribute of the parent type.</param>
+//     /// <param name="dataContractAttribute">The DataContract attribute of the type.</param>
+//     /// <param name="tagsToHide">A list of tags to be hidden in the OpenAPI documentation.</param>
+//     /// <param name="required">A set of required properties.</param>
+//     /// <param name="nsManager">The XML namespace manager.</param>
+//     /// <param name="properties">The properties to be processed and added to the OpenAPI schema.</param>
+//     private static void ProcessProperties(OpenApiSchema definitionSchema,
+//         DataContractAttribute parentDataContractAttribute, DataContractAttribute dataContractAttribute,
+//         List<string> tagsToHide, SortedSet<string> required,
+//         XmlNamespaceManager nsManager,
+//         IEnumerable<(PropertyInfo, DataMemberAttribute)> properties)
+//     {
+//         foreach (var (property, dataMemberAttribute) in properties)
+//         {
+//             if (property == null) continue;
+//
+//             var hiddenAttribute = property.GetCustomAttribute<OpenApiHiddenAttribute>();
+//             if (hiddenAttribute != null) continue;
+//
+//             var isHidden = false;
+//             foreach (var tagAttribute in property.GetCustomAttributes<OpenApiTagAttribute>())
+//                 if (tagsToHide.Contains(tagAttribute.Tag))
+//                     isHidden = true;
+//
+//             if (isHidden) continue;
+//
+//             var name = dataMemberAttribute.Name ?? property.Name;
+//
+//             var memberPropertiesAttribute =
+//                 property.GetCustomAttribute<OpenApiPropertyAttribute>();
+//
+//             IEnumerable<CustomAttributeNamedArgument> memberPropertiesAttributeData = property
+//                 .GetCustomAttributesData()
+//                 .FirstOrDefault(data => data.AttributeType == typeof(OpenApiPropertyAttribute))
+//                 ?.NamedArguments;
+//             var maxLengthSet = memberPropertiesAttributeData?.Any(arg => arg.MemberName == "MaxLength") ?? false;
+//             var minLengthSet = memberPropertiesAttributeData?.Any(arg => arg.MemberName == "MinLength") ?? false;
+//
+//             if (memberPropertiesAttribute?.IsRequired ?? false) required.Add(name);
+//
+//             ProcessTypeToSchema(parentDataContractAttribute, dataContractAttribute, name,
+//                 definitionSchema, property, memberPropertiesAttribute, nsManager);
+//         }
+//     }
+//
+//     /// <summary>
+//     ///     Processes the given type to an OpenApiSchema.
+//     /// </summary>
+//     /// <param name="parentDataContractAttribute">The parent data contract attribute.</param>
+//     /// <param name="dataContractAttribute">The data contract attribute of the processed type.</param>
+//     /// <param name="name">The name of the property.</param>
+//     /// <param name="definitionSchema">The OpenApiSchema to which the processed type will be added.</param>
+//     /// <param name="property">The property info of the processed type.</param>
+//     /// <param name="memberPropertiesAttribute">The OpenApiPropertyAttribute of the processed type.</param>
+//     /// <param name="nsManager">The XmlNamespaceManager for managing namespaces.</param>
+//     private static void ProcessTypeToSchema(DataContractAttribute parentDataContractAttribute,
+//         DataContractAttribute dataContractAttribute, string name, OpenApiSchema definitionSchema,
+//         PropertyInfo property, OpenApiPropertyAttribute memberPropertiesAttribute, XmlNamespaceManager nsManager)
+//     {
+//         var innerDataContractAttribute =
+//             property.PropertyType.GetCustomAttribute<DataContractAttribute>();
+//
+//         string schemaKey;
+//         if (innerDataContractAttribute != null)
+//         {
+//             schemaKey = GetSchemaKey(dataContractAttribute, innerDataContractAttribute, property.PropertyType,
+//                 property.PropertyType.IsArray);
+//             definitionSchema.Properties.Add(name, new OpenApiSchema
+//             {
+//                 Reference = new OpenApiReference
+//                 {
+//                     Type = ReferenceType.Schema,
+//                     Id = schemaKey
+//                 },
+//                 Description = memberPropertiesAttribute?.Description
+//             });
+//         }
+//         else
+//         {
+//             var propertyTypeKind = GetTypeKind(property.PropertyType, out var actualType);
+//             switch (propertyTypeKind)
+//             {
+//                 case TypeKind.UnderlyingType:
+//                     var underlyingTypeDataContract = actualType.GetCustomAttribute<DataContractAttribute>();
+//                     schemaKey = GetSchemaKey(parentDataContractAttribute, underlyingTypeDataContract, actualType,
+//                         false);
+//                     definitionSchema.Properties.Add(name, new OpenApiSchema
+//                     {
+//                         Reference = new OpenApiReference
+//                         {
+//                             Type = ReferenceType.Schema,
+//                             Id = schemaKey
+//                         },
+//                         //TODO
+//                         Description = memberPropertiesAttribute?.Description ??
+//                                       property.GetCustomAttribute<DescriptionAttribute>()?.Description
+//                     });
+//                     break;
+//                 case TypeKind.ArrayType:
+//                     var innerArrayTypeDataContractAttribute =
+//                         actualType.GetCustomAttribute<DataContractAttribute>();
+//                     if (innerArrayTypeDataContractAttribute != null)
+//                     {
+//                         schemaKey = GetSchemaKey(parentDataContractAttribute, innerArrayTypeDataContractAttribute,
+//                             actualType, true);
+//                         var newSchema = new OpenApiSchema
+//                         {
+//                             Type = GetJSONSchemaType(property.PropertyType),
+//                             Description = memberPropertiesAttribute?.Description ??
+//                                           property.GetCustomAttribute<DescriptionAttribute>()?.Description,
+//                             Items = new OpenApiSchema
+//                             {
+//                                 Reference = new OpenApiReference
+//                                 {
+//                                     Type = ReferenceType.Schema,
+//
+//                                     Id = schemaKey
+//                                 },
+//                                 Xml = new OpenApiXml
+//                                 {
+//                                     Namespace = new Uri(ArrayNamespace),
+//                                     //TODO
+//                                     // Name = innerDataMemberAttribute.Name,
+//                                     Name = actualType.Name,
+//                                     Prefix = FindPrefix(nsManager, ArrayNamespace)
+//                                 }
+//                             }
+//                         };
+//                         definitionSchema.Properties.Add(name, newSchema);
+//                     }
+//                     else
+//                     {
+//                         //TODO array with primitive types
+//                         var openApiType = GetJSONSchemaType(actualType);
+//                         if (!string.IsNullOrEmpty(openApiType))
+//                             definitionSchema.Properties.Add(name, new OpenApiSchema
+//                             {
+//                                 Type = GetJSONSchemaType(property.PropertyType),
+//                                 Description = memberPropertiesAttribute?.Description ??
+//                                               property.GetCustomAttribute<DescriptionAttribute>()?.Description,
+//                                 Items = new OpenApiSchema
+//                                 {
+//                                     Type = openApiType,
+//                                     Xml = new OpenApiXml
+//                                     {
+//                                         Namespace = new Uri(ArrayNamespace),
+//                                         //TODO
+//                                         // Name = innerDataMemberAttribute.Name,
+//                                         Name = actualType.Name,
+//                                         Prefix = FindPrefix(nsManager, ArrayNamespace)
+//                                     }
+//                                 }
+//                             });
+//                     }
+//
+//                     break;
+//                 case TypeKind.EnumType:
+//                     definitionSchema.Properties.Add(name, new OpenApiSchema
+//                     {
+//                         Type = GetJSONSchemaType(property.PropertyType),
+//                         Format = memberPropertiesAttribute?.Format ?? GetFormatType(property.PropertyType),
+//                         Description = memberPropertiesAttribute?.Description ??
+//                                       property.GetCustomAttribute<DescriptionAttribute>()?.Description,
+//                         Enum = GetEnumValuesAsOpenApiStrings(property.PropertyType),
+//                         Default = GetCustomDefaultValue(property.PropertyType) ?? GetDefaultValueAttribute(property)
+//                     });
+//                     break;
+//                 case TypeKind.EnumerableType:
+//                     innerArrayTypeDataContractAttribute =
+//                         actualType.GetCustomAttribute<DataContractAttribute>();
+//                     if (innerArrayTypeDataContractAttribute != null)
+//                     {
+//                         // ProcessTypeAttributes(definitionSchema, parent, arrayType, tagsToHide, required, parentNs, parentPrefix, nsManager, ns, prefix);
+//                         var newSchema = new OpenApiSchema
+//                         {
+//                             Type = "array",
+//                             Description = memberPropertiesAttribute?.Description ??
+//                                           property.GetCustomAttribute<DescriptionAttribute>()?.Description,
+//                             Items = new OpenApiSchema
+//                             {
+//                                 Reference = new OpenApiReference
+//                                 {
+//                                     Type = ReferenceType.Schema,
+//
+//                                     // Id = GetSchemaKey(innerDataMemberAttribute, innerDataMemberAttribute, true),
+//                                     Id = GetSchemaKey(parentDataContractAttribute, innerArrayTypeDataContractAttribute,
+//                                         actualType, true)
+//                                 },
+//                                 Xml = new OpenApiXml
+//                                 {
+//                                     Namespace = new Uri(ArrayNamespace),
+//                                     //TODO
+//                                     // Name = innerDataMemberAttribute.Name,
+//                                     Name = actualType.Name,
+//                                     Prefix = FindPrefix(nsManager, ArrayNamespace)
+//                                 }
+//                             }
+//                         };
+//                         definitionSchema.Properties.Add(name, newSchema);
+//                     }
+//                     else
+//                     {
+//                         //TODO array with primitive types
+//                         // string openApiType = GetType(innerType);
+//                         var openApiType = GetJSONSchemaType(actualType.GetElementType());
+//                         if (!string.IsNullOrEmpty(openApiType))
+//                             definitionSchema.Properties.Add(name, new OpenApiSchema
+//                             {
+//                                 Type = "array",
+//                                 Description = memberPropertiesAttribute?.Description ??
+//                                               property.GetCustomAttribute<DescriptionAttribute>()?.Description,
+//                                 Items = new OpenApiSchema
+//                                 {
+//                                     Type = openApiType,
+//                                     Xml = new OpenApiXml
+//                                     {
+//                                         // Namespace = new Uri(ArrayNamespace),
+//                                         Name = actualType.Name.ToLower()
+//                                         // Prefix = FindPrefix(nsManager, ArrayNamespace)
+//                                     }
+//                                 }
+//                             });
+//                     }
+//
+//                     break;
+//                 case TypeKind.InterfaceType:
+//                     return;
+//                 case TypeKind.DateTimeType:
+//                 case TypeKind.PrimitiveType:
+//                     definitionSchema.Properties.Add(name, new OpenApiSchema
+//                     {
+//                         Type = GetJSONSchemaType(property.PropertyType),
+//                         Default = GetCustomDefaultValue(property.PropertyType) ?? GetDefaultValueAttribute(property),
+//                         Description = memberPropertiesAttribute?.Description ??
+//                                       property.GetCustomAttribute<DescriptionAttribute>()?.Description,
+//                         MinLength = memberPropertiesAttribute?.MinLength,
+//                         MaxLength = memberPropertiesAttribute?.MaxLength,
+//                         Format = memberPropertiesAttribute?.Format ?? GetFormatType(property.PropertyType)
+//                     });
+//                     break;
+//                 default:
+//                     return;
+//                     // throw new InvalidOperationException("Unsupported property type: " + processedType.FullName);
+//             }
+//         }
+//     }
+//
+//
+//     //TODO
+//     private static List<IOpenApiAny> GetEnumValuesAsOpenApiStrings(Type type)
+//     {
+//         var enumType = type.IsEnum
+//             ? type
+//             : TryGetUnderlyingNullableType(type, out var underlyingType)
+//                 ? underlyingType
+//                 : null;
+//         if (enumType is { IsEnum: true })
+//             return Enum.GetValues(enumType)
+//                 .Cast<object>()
+//                 .Select(value => new OpenApiString(value.ToString()))
+//                 .Cast<IOpenApiAny>()
+//                 .ToList();
+//         return null;
+//     }
+//
+//
+//     /// <summary>
+//     ///     Retrieves the default value of a property.
+//     /// </summary>
+//     /// <param name="propertyInfo">The property information.</param>
+//     /// <returns>
+//     ///     An IOpenApiAny object representing the default value of the property.
+//     ///     If the DefaultValueAttribute does not exist, returns null.
+//     /// </returns>
+//     public static IOpenApiAny GetDefaultValueAttribute(PropertyInfo propertyInfo)
+//     {
+//         var attribute = propertyInfo.GetCustomAttribute<DefaultValueAttribute>();
+//         if (attribute != null)
+//         {
+//             var value = Convert.ChangeType(attribute.Value, propertyInfo.PropertyType);
+//             return GetCustomDefaultValue(propertyInfo.PropertyType, value);
+//         }
+//
+//         return null;
+//     }
+//
+//     /// <summary>
+//     ///     Gets the default value for the specified open schema of primitive type.
+//     /// </summary>
+//     /// <param name="type">The type of the value.</param>
+//     /// <param name="value"></param>
+//     /// <returns>The default value.</returns>
+//     private static IOpenApiAny GetCustomDefaultValue(Type type, object value = null)
+//     {
+//         if (type == typeof(DateTime)) return new OpenApiDateTime(DateTime.Now);
+//
+//         if (type == typeof(int))
+//         {
+//             if (value != null) return new OpenApiInteger((int)value);
+//         }
+//         else if (type == typeof(double))
+//         {
+//             if (value != null) return new OpenApiDouble((double)value);
+//         }
+//         else if (type.IsEnum)
+//         {
+//             if (value != null && value is Enum enumValue) return new OpenApiString(enumValue.ToString());
+//         }
+//         else if (type == typeof(string))
+//         {
+//             if (value != null) return new OpenApiString((string)value);
+//         }
+//
+//         // Add more else if blocks here for other types you want to handle
+//
+//         // If the type is not handled above, return null or throw an exception
+//         return null;
+//     }
+//
+//     /// <summary>
+//     ///     Figure out the valid namespace for XML serialization.
+//     /// </summary>
+//     /// <param name="ns">The namespace from the data contract.</param>
+//     /// <param name="type">The type itself.</param>
+//     /// <returns>A valid XML namespace if applicable.</returns>
+//     private static string FindNamespace(string ns, Type type)
+//     {
+//         if (ns == null) return $"{DataContractNamespace}{type.Namespace}";
+//
+//         return ns;
+//     }
+//
+//     /// <summary>
+//     ///     Figure out a valid prefix for XML serialization.
+//     /// </summary>
+//     /// <param name="nsManager">XmlNamespaceManager instance.</param>
+//     /// <param name="ns">Valid namespace for XML serialization.</param>
+//     /// <returns>A valid XML prefix.</returns>
+//     private static string FindPrefix(XmlNamespaceManager nsManager, string ns)
+//     {
+//         var prefix = nsManager.LookupPrefix(ns);
+//         if (!string.IsNullOrEmpty(prefix)) return prefix;
+//
+//         var index = 0;
+//         var enumerator = nsManager.GetEnumerator();
+//         using var unknown = enumerator as IDisposable;
+//         while (enumerator.MoveNext()) index++;
+//
+//         index++;
+//
+//         prefix = $"ns{index}";
+//         nsManager.AddNamespace(prefix, ns);
+//         return prefix;
+//     }
+//
+//     /// <summary>
+//     ///     Map a .NET type to JSON schema type.
+//     /// </summary>
+//     /// <param name="type">The type to be mapped.</param>
+//     /// <returns>The mapped type.</returns>
+//     private static string GetJSONSchemaType(Type type)
+//     {
+//         if (type == null) return null;
+//
+//         var actualType = IsNullable(type) ? Nullable.GetUnderlyingType(type) : type;
+//
+//         if (actualType == typeof(int) || actualType == typeof(long) || actualType == typeof(short) ||
+//             actualType == typeof(byte) || actualType == typeof(sbyte) || actualType == typeof(ushort) ||
+//             actualType == typeof(ulong))
+//             return "integer";
+//         if (actualType == typeof(float) || actualType == typeof(double) || actualType == typeof(decimal))
+//             return "number";
+//         if (actualType == typeof(string) || actualType == typeof(Guid) || actualType == typeof(char)
+//             || actualType is { IsEnum: true } || actualType == typeof(DateTime) || actualType == typeof(DateTimeOffset))
+//             // || actualType == typeof(DateOnly))
+//             return "string";
+//         if (actualType == typeof(bool))
+//             return "boolean";
+//         if (type.IsArray || (type.IsGenericType && type.GetGenericTypeDefinition() == typeof(List<>))) return "array";
+//
+//
+//         return null;
+//     }
+//
+//     private static string GetFormatType(Type realType)
+//     {
+//         var actualType = IsNullable(realType) ? Nullable.GetUnderlyingType(realType) : realType;
+//         if (actualType == typeof(DateTime) || actualType == typeof(DateTimeOffset))
+//             return "date-time";
+//         // if (actualType == typeof(DateOnly))
+//         //     return "date";
+//         // if (actualType == typeof(TimeOnly))
+//         //     return "time";
+//         if (actualType is { IsEnum: true }) return "enum";
+//
+//         return null;
+//     }
+//
+//     //TODO
+//     /// <summary>
+//     ///     Check if a type is nullable.
+//     /// </summary>
+//     /// <param name="type">The type to check.</param>
+//     /// <returns>Whether the type is nullable.</returns>
+//     private static bool IsNullable(Type type)
+//     {
+//         return type.IsGenericType && type.GetGenericTypeDefinition() == typeof(Nullable<>);
+//     }
+//
+//
+//     private static bool TryGetUnderlyingNullableType(Type type, out Type underlyingType)
+//     {
+//         if (IsNullable(type))
+//         {
+//             underlyingType = Nullable.GetUnderlyingType(type);
+//             return true;
+//         }
+//
+//         underlyingType = null;
+//         return false;
+//     }
+//
+//     /// <summary>
+//     ///     Determines the type kind of the given property type.
+//     /// </summary>
+//     /// <param name="type"></param>
+//     /// <param name="actualType">
+//     ///     When this method returns, contains the actual type of type is a
+//     ///     nullable type, an enumerable type, an array type, or an interface type; otherwise, null. This parameter is passed
+//     ///     uninitialized.
+//     /// </param>
+//     /// <returns>The <see cref="TypeKind" /> of the property type.</returns>
+//     private static TypeKind GetTypeKind(Type type, out Type actualType)
+//     {
+//         if (TryGetUnderlyingNullableType(type, out var underlyingType))
+//             if (Attribute.GetCustomAttribute(underlyingType, typeof(DataContractAttribute)) is DataContractAttribute
+//                 dataContractAttribute)
+//             {
+//                 actualType = underlyingType;
+//                 return TypeKind.UnderlyingType;
+//             }
+//
+//         var arrayType = type.GetElementType();
+//         var enumerableType = type.GetInterface("IEnumerable") != null && type != typeof(string)
+//             ? type.GetGenericArguments().FirstOrDefault()
+//             : null;
+//
+//         if (enumerableType != null)
+//         {
+//             actualType = enumerableType;
+//             return TypeKind.EnumerableType;
+//         }
+//
+//         if (arrayType != null)
+//         {
+//             actualType = arrayType;
+//             return TypeKind.ArrayType;
+//         }
+//
+//         if (type.IsInterface)
+//         {
+//             actualType = type;
+//             return TypeKind.InterfaceType;
+//         }
+//
+//         if (type.BaseType != null && type.BaseType.IsArray)
+//         {
+//             actualType = type.BaseType.GetElementType();
+//             return TypeKind.ArrayType;
+//         }
+//
+//         if (type.IsEnum)
+//         {
+//             actualType = type;
+//             return TypeKind.EnumType;
+//         }
+//
+//         if (type.IsPrimitive || type == typeof(string)
+//                              || underlyingType is { IsPrimitive: true } || underlyingType == typeof(string)
+//                              || type == typeof(decimal)
+//                              || underlyingType == typeof(decimal))
+//         {
+//             actualType = type;
+//             return TypeKind.PrimitiveType;
+//         }
+//
+//         if (type == typeof(DateTime)
+//             || (underlyingType != null && underlyingType == typeof(DateTime)))
+//             // if (type == typeof(DateTime) || type == typeof(DateOnly)
+//             //                              || (underlyingType != null && underlyingType == typeof(DateTime)) ||
+//             //                              underlyingType == typeof(DateOnly))
+//         {
+//             actualType = underlyingType ?? type;
+//             return TypeKind.DateTimeType;
+//         }
+//
+//         actualType = null;
+//         return TypeKind.None;
+//     }
+//
+//     /// <summary>
+//     ///     Decides what the default content type should be.
+//     /// </summary>
+//     private class DefaultContentType
+//     {
+//         /// <summary>
+//         ///     Whether the format was explicitly set in the WebGet/WebInvoke attribute for the response
+//         /// </summary>
+//         public bool ResponseFormatExplicitlySet { get; set; }
+//
+//         /// <summary>
+//         ///     The format set in the WebGet/WebInvoke attribute for the response.
+//         /// </summary>
+//         public WebMessageFormat ResponseAttributeFormat { get; set; }
+//
+//         /// <summary>
+//         ///     The default format in the WebHttpBehavior for the response.
+//         /// </summary>
+//         public WebMessageFormat ResponseBehaviorFormat { get; set; }
+//
+//         /// <summary>
+//         ///     Whether the format was explicitly set in the WebGet/WebInvoke attribute for the request
+//         /// </summary>
+//         public bool RequestFormatExplicitlySet { get; set; }
+//
+//         /// <summary>
+//         ///     The format set in the WebGet/WebInvoke attribute for the request.
+//         /// </summary>
+//         public WebMessageFormat RequestAttributeFormat { get; set; }
+//
+//         /// <summary>
+//         ///     The content type the default response should have.
+//         /// </summary>
+//         public IEnumerable<string> GetContentTypes(bool isResponse)
+//         {
+//             if (isResponse)
+//             {
+//                 var format =
+//                     ResponseFormatExplicitlySet ? ResponseAttributeFormat : ResponseBehaviorFormat;
+//                 switch (format)
+//                 {
+//                     case WebMessageFormat.Json:
+//                         return new[] { "application/json" };
+//                     case WebMessageFormat.Xml:
+//                         return new[] { "application/xml" };
+//                     default:
+//                         return null;
+//                 }
+//             }
+//
+//             if (RequestFormatExplicitlySet)
+//                 switch (RequestAttributeFormat)
+//                 {
+//                     case WebMessageFormat.Json:
+//                         return new[] { "application/json", "text/json" };
+//                     case WebMessageFormat.Xml:
+//                         return new[] { "application/xml", "text/xml" };
+//                     default:
+//                         //TODO thow ARgumentExceptiopn enum 
+//                         return null;
+//                 }
+//
+//             return new[] { "application/json", "text/json", "application/xml", "text/xml" };
+//         }
+//     }
+//
+//     /// <summary>
+//     ///     Information about an operation.
+//     /// </summary>
+//     private class OperationInfo
+//     {
+//         /// <summary>
+//         ///     Operation method.
+//         /// </summary>
+//         public string Method { get; set; }
+//
+//         /// <summary>
+//         ///     Operation URI.
+//         /// </summary>
+//         public string UriTemplate { get; set; }
+//
+//         /// <summary>
+//         ///     Whether the response format was explicitly set.
+//         /// </summary>
+//         public bool IsResponseFormatSetExplicitly { get; set; }
+//
+//         /// <summary>
+//         ///     The response format.
+//         /// </summary>
+//         public WebMessageFormat ResponseFormat { get; set; }
+//
+//         /// <summary>
+//         ///     Whether the request format was explicitly set.
+//         /// </summary>
+//         public bool IsRequestFormatSetExplicitly { get; set; }
+//
+//         /// <summary>
+//         ///     The request format.
+//         /// </summary>
+//         public WebMessageFormat RequestFormat { get; set; }
+//     }
+// }
