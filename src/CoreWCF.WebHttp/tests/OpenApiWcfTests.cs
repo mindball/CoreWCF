@@ -4,6 +4,7 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Data;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -14,6 +15,7 @@ using System.Threading.Tasks;
 using CoreWCF.OpenApi;
 using CoreWCF.OpenApi.Attributes;
 using CoreWCF.Web;
+using Microsoft.OpenApi.Any;
 using Microsoft.OpenApi.Models;
 using Microsoft.OpenApi.Writers;
 using Xunit;
@@ -269,13 +271,18 @@ namespace CoreWCF.WebHttp.Tests
             [OpenApiOperation(Summary = "summary", Description = "description")]
             [WebGet(UriTemplate = "/path")]
             public void Operation();
+
+            [Obsolete]
+            [OpenApiOperation(Summary = "summary", Description = "description", Deprecated = true)]
+            [WebGet(UriTemplate = "/path")]
+            public void MethodDeprecated();
         }
 
+        //TODO confused for OpenApiOperation(look at OpenApiSchemaBuilder from where is referenced it)
         [Fact]
         public void OperationSummaryDescriptionSet()
         {
             JsonElement json = GetJson(new OpenApiOptions(), new List<Type> { typeof(IOperationSummaryDescriptionSet) });
-
             string summary = json
                 .GetProperty("paths")
                 .GetProperty("/path")
@@ -744,7 +751,7 @@ namespace CoreWCF.WebHttp.Tests
         internal class SimpleRequest { }
 
         [DataContract()]
-        internal class SimpleRequestNoDCName { }
+        internal class SimpleRequestNoSetDataContractName { }
 
         private interface IRequestBodyContentTypeFallthrough
         {
@@ -752,13 +759,16 @@ namespace CoreWCF.WebHttp.Tests
             public void FromAttribute(SimpleRequest request);
 
             [WebInvoke(Method = "POST", UriTemplate = "/default")]
-            public void Default(SimpleRequestNoDCName request);
-
-            [WebInvoke(Method = "POST", UriTemplate = "/attribute", RequestFormat = WebMessageFormat.Json)]
-            public void FromAttributeV2(SimpleRequestNoDCName request);
+            public void Default(SimpleRequest request);
 
             [WebInvoke(Method = "POST", UriTemplate = "/default")]
-            public void DefaultV2(SimpleRequestNoDCName request);
+            public void Default(SimpleRequestNoSetDataContractName request);
+
+            [WebInvoke(Method = "POST", UriTemplate = "/attribute", RequestFormat = WebMessageFormat.Json)]
+            public void FromAttributeV2(SimpleRequestNoSetDataContractName request);
+
+            [WebInvoke(Method = "POST", UriTemplate = "/default")]
+            public void DefaultV2(SimpleRequestNoSetDataContractName request);
         }
 
         [Fact]
@@ -867,7 +877,7 @@ namespace CoreWCF.WebHttp.Tests
         private class SimpleSchema { }
 
         [DataContract]
-        private class SimpleSchema_DataContractNameNotDefined { }
+        private class SimpleSchemaNoSetDataContractName { }
 
         private interface ISchemaOnlyAddedOnce
         {
@@ -878,9 +888,14 @@ namespace CoreWCF.WebHttp.Tests
             void Two([OpenApiParameter(ContentTypes = new[] {"application/json"})] SimpleSchema body);
 
             [WebInvoke(Method = "POST", UriTemplate = "/one")]
-            void OneV2(
+            void OneNoSetDataContractName(
                 [OpenApiParameter(ContentTypes = new[] {"application/json"})]
-                SimpleSchema_DataContractNameNotDefined body);
+                SimpleSchemaNoSetDataContractName body);
+
+            [WebInvoke(Method = "POST", UriTemplate = "/one")]
+            void TwoNoSetDataContractName(
+                [OpenApiParameter(ContentTypes = new[] {"application/json"})]
+                SimpleSchemaNoSetDataContractName body);
         }
 
         [Fact]
@@ -896,7 +911,7 @@ namespace CoreWCF.WebHttp.Tests
             json
                 .GetProperty("components")
                 .GetProperty("schemas")
-                .GetProperty(typeof(SimpleSchema_DataContractNameNotDefined).GetFullNameSpace());
+                .GetProperty(typeof(SimpleSchemaNoSetDataContractName).GetFullNameSpace());
         }
 
         [DataContract(Name = "CircularSchemaOne")]
@@ -906,7 +921,7 @@ namespace CoreWCF.WebHttp.Tests
 
             public CircularSchemaTwo Two { get; set; }
 
-            public CircularSchemaThreeNoDCName Three { get; set; }
+            public CircularSchemaThreeNoSetDataContractName Three { get; set; }
         }
 
         [DataContract(Name = "CircularSchemaTwo")]
@@ -916,17 +931,17 @@ namespace CoreWCF.WebHttp.Tests
 
             public CircularSchemaTwo Two { get; set; }
 
-            public CircularSchemaThreeNoDCName Three { get; set; }
+            public CircularSchemaThreeNoSetDataContractName Three { get; set; }
         }
 
         [DataContract()]
-        private class CircularSchemaThreeNoDCName
+        private class CircularSchemaThreeNoSetDataContractName
         {
             public CircularSchemaOne One { get; set; }
         
             public CircularSchemaTwo Two { get; set; }
             
-            public CircularSchemaThreeNoDCName Three { get; set; }
+            public CircularSchemaThreeNoSetDataContractName Three { get; set; }
         }
 
         private interface ICircularSchemaWorks
@@ -938,7 +953,7 @@ namespace CoreWCF.WebHttp.Tests
             void Two([OpenApiParameter(ContentTypes = new[] { "application/json" })] CircularSchemaTwo body);
 
             [WebInvoke(Method = "POST", UriTemplate = "/three")]
-            void Three([OpenApiParameter(ContentTypes = new[] { "application/json" })] CircularSchemaThreeNoDCName body);
+            void Three([OpenApiParameter(ContentTypes = new[] { "application/json" })] CircularSchemaThreeNoSetDataContractName body);
         }
 
         [Fact]
@@ -959,7 +974,7 @@ namespace CoreWCF.WebHttp.Tests
             json
                 .GetProperty("components")
                 .GetProperty("schemas")
-                .GetProperty(typeof(CircularSchemaThreeNoDCName).GetFullNameSpace());
+                .GetProperty(typeof(CircularSchemaThreeNoSetDataContractName).GetFullNameSpace());
         }
 
         [DataContract(Name = "NestedClassOne")]
@@ -980,11 +995,21 @@ namespace CoreWCF.WebHttp.Tests
         private class NestedClassThree
         {
             [DataMember]
-            public NestedClassFour Four { get; set; }
+            public NestedClassFourNoSetDataContractName Four { get; set; }
         }
 
         [DataContract]
-        private class NestedClassFour { }
+        private class NestedClassFourNoSetDataContractName
+        {
+            [DataMember]
+            public NestedClassFiveNoSetDataContractName Five { get; set; }
+        }
+
+        [DataContract]
+        private class NestedClassFiveNoSetDataContractName
+        {
+        }
+        
 
         private interface INestedTypesAddedToSchemas
         {
@@ -1014,26 +1039,43 @@ namespace CoreWCF.WebHttp.Tests
                 .GetProperty("Three")
                 .GetProperty("$ref")
                 .GetString();
-
+            
             string referenceThree = json
                 .GetProperty("components")
                 .GetProperty("schemas")
                 .GetProperty("NestedClassTwo-NestedClassThree")
                 .GetProperty("properties")
-                .GetProperty(typeof(NestedClassFour).GetFullNameSpace())
+                .GetProperty("Four")
+                .GetProperty("$ref")
+                .GetString();
+
+            var jsonString = json.ToString();
+
+            string referenceFour = json
+                .GetProperty("components")
+                .GetProperty("schemas")
+                .GetProperty($"NestedClassThree-NestedClassFourNoSetDataContractName")
+                .GetProperty("properties")
+                .GetProperty("Five")
                 .GetProperty("$ref")
                 .GetString();
 
             json
                 .GetProperty("components")
                 .GetProperty("schemas")
+                .GetProperty(typeof(NestedClassFiveNoSetDataContractName).GetFullNameSpace());
+
+
+            json
+                .GetProperty("components")
+                .GetProperty("schemas")
                 .GetProperty("NestedClassTwo-NestedClassThree");
 
-            
 
             Assert.Equal("#/components/schemas/NestedClassOne-NestedClassTwo", referenceOne);
             Assert.Equal("#/components/schemas/NestedClassTwo-NestedClassThree", referenceTwo);
-            Assert.Equal("#/components/schemas/NestedClassThree-NestedClassFour", referenceTwo);
+            Assert.Equal("#/components/schemas/NestedClassThree-NestedClassFourNoSetDataContractName", referenceThree);
+            Assert.Equal($"#/components/schemas/{typeof(NestedClassFiveNoSetDataContractName).GetFullNameSpace()}", referenceFour);
         }
 
         [DataContract(Name = "CollectionClass")]
@@ -1041,10 +1083,16 @@ namespace CoreWCF.WebHttp.Tests
         {
             [DataMember(Name = "Collection")]
             public List<CollectionInnerClass> Collection { get; set; }
+
+            [DataMember]
+            public List<CollectionNoSetDataContractName> CollectionNoSetDataMemberName { get; set; }
         }
 
         [DataContract(Name = "CollectionInnerClass")]
         private class CollectionInnerClass { }
+
+        [DataContract]
+        private class CollectionNoSetDataContractName { }
 
         private interface IGenericCollectionTypeAddedToSchemas
         {
@@ -1076,13 +1124,29 @@ namespace CoreWCF.WebHttp.Tests
                 .GetProperty("$ref")
                 .GetString();
 
+            string referenceTwo = json
+                .GetProperty("components")
+                .GetProperty("schemas")
+                .GetProperty("CollectionClass")
+                .GetProperty("properties")
+                .GetProperty("CollectionNoSetDataMemberName")
+                .GetProperty("items")
+                .GetProperty("$ref")
+                .GetString();
+
             json
                 .GetProperty("components")
                 .GetProperty("schemas")
                 .GetProperty("CollectionClass-Array-CollectionInnerClass");
 
+            json
+                .GetProperty("components")
+                .GetProperty("schemas")
+                .GetProperty($"CollectionClass-Array-{nameof(CollectionNoSetDataContractName)}");
+
             Assert.Equal("array", type);
             Assert.Equal("#/components/schemas/CollectionClass-Array-CollectionInnerClass", reference);
+            Assert.Equal($"#/components/schemas/CollectionClass-Array-{nameof(CollectionNoSetDataContractName)}", referenceTwo);
         }
 
         [DataContract(Name = "NoDataMemberClass")]
@@ -1091,10 +1155,19 @@ namespace CoreWCF.WebHttp.Tests
             public string Property { get; set; }
         }
 
+        [DataContract]
+        private class NoDataMemberClassNotSetDataContractName
+        {
+            public string Property { get; set; }
+        }
+
         private interface IPropertyMustBeDataMemberToBeAddedToSchema
         {
             [WebInvoke(Method = "POST", UriTemplate = "/path")]
             void Operation([OpenApiParameter(ContentTypes = new[] { "application/json" })] NoDataMemberClass body);
+
+            [WebInvoke(Method = "POST", UriTemplate = "/path")]
+            void Operation([OpenApiParameter(ContentTypes = new[] { "application/json" })] NoDataMemberClassNotSetDataContractName body);
         }
 
         [Fact]
@@ -1106,6 +1179,12 @@ namespace CoreWCF.WebHttp.Tests
                 .GetProperty("components")
                 .GetProperty("schemas")
                 .GetProperty("NoDataMemberClass")
+                .GetProperty("properties"));
+
+            Assert.Throws<KeyNotFoundException>(() => json
+                .GetProperty("components")
+                .GetProperty("schemas")
+                .GetProperty(typeof(NoDataMemberClassNotSetDataContractName).GetFullNameSpace())
                 .GetProperty("properties"));
         }
 
@@ -1256,16 +1335,107 @@ namespace CoreWCF.WebHttp.Tests
                 .GetProperty("format"));
         }
 
+        [DataContract(Name = "DateTimePropertyClass")]
+        private class DateTimePropertyClass
+        {
+            [DataMember(Name = "Property")]
+            public DateTime Property { get; set; }
+
+            [DataMember(Name = "Property2")]
+            public DateTime Property2 { get; set; }
+        }
+
+        [DataContract]
+        private class DateTimePropertyClassNotSetDataContractName
+        {
+            [DataMember]
+            public DateTime Property { get; set; }
+
+            [DataMember]
+            public DateTime Property2 { get; set; }
+        }
+
+        private interface IDateTimePropertyAdded
+        {
+            [WebInvoke(Method = "POST", UriTemplate = "/path")]
+            void Operation([OpenApiParameter(ContentTypes = new[] { "application/json" })] DateTimePropertyClass body);
+
+            [WebInvoke(Method = "POST", UriTemplate = "/path")]
+            void Operation([OpenApiParameter(ContentTypes = new[] { "application/json" })] DateTimePropertyClassNotSetDataContractName body);
+        }
+
+        [Fact]
+        public void DateTimePropertyAdded()
+        {
+            JsonElement json = GetJson(new OpenApiOptions(), new List<Type> { typeof(IDateTimePropertyAdded) });
+
+            JsonElement schema = json
+                .GetProperty("components")
+                .GetProperty("schemas")
+                .GetProperty("DateTimePropertyClass");
+            
+            JsonElement schemaWithNotSetName = json
+                .GetProperty("components")
+                .GetProperty("schemas")
+                .GetProperty(typeof(DateTimePropertyClassNotSetDataContractName).GetFullNameSpace());
+            
+            string schemaType = schema
+                .GetProperty("type")
+                .GetString();
+
+            string schemaTypeTwo = schemaWithNotSetName
+                .GetProperty("type")
+                .GetString();
+
+            string type = schema
+                .GetProperty("properties")
+                .GetProperty("Property")
+                .GetProperty("type")
+                .GetString();
+
+            string typeTwo = schemaWithNotSetName
+                .GetProperty("properties")
+                .GetProperty("Property")
+                .GetProperty("type")
+                .GetString();
+            
+            string format = schema
+                .GetProperty("properties")
+                .GetProperty("Property")
+                .GetProperty("format")
+                .GetString();
+
+            string formatTwo = schemaWithNotSetName
+                .GetProperty("properties")
+                .GetProperty("Property")
+                .GetProperty("format")
+                .GetString();
+
+            Assert.Equal("object", schemaType);
+            Assert.Equal("object", schemaTypeTwo);
+            Assert.Equal("string", type);
+            Assert.Equal("string", typeTwo);
+            
+            Assert.Equal("date-time", format);
+            Assert.Equal("date-time", formatTwo);
+        }
+        
         [DataContract(Name = "ComplexPropertyClass")]
         private class ComplexPropertyClass
         {
             [DataMember(Name = "Property")]
             [OpenApiProperty(Description = "description", IsRequired = true)]
             public ComplexPropertyInnerClass Property { get; set; }
+
+            [DataMember()]
+            public ComplexPropertyInnerClassNotSetDataContractName PropertyNotSetDataMemberName { get; set; }
         }
 
         [DataContract(Name = "ComplexPropertyInnerClass")]
         private class ComplexPropertyInnerClass { }
+
+        [DataContract]
+        private class ComplexPropertyInnerClassNotSetDataContractName { }
 
         private interface IComplexPropertyAdded
         {
@@ -1277,7 +1447,7 @@ namespace CoreWCF.WebHttp.Tests
         public void ComplexPropertyAdded()
         {
             JsonElement json = GetJson(new OpenApiOptions(), new List<Type> { typeof(IComplexPropertyAdded) });
-
+            var j = json.ToString();
             JsonElement schema = json
                 .GetProperty("components")
                 .GetProperty("schemas")
@@ -1298,10 +1468,17 @@ namespace CoreWCF.WebHttp.Tests
                 .GetProperty("$ref")
                 .GetString();
 
+            string referenceTwo = schema
+                .GetProperty("properties")
+                .GetProperty("PropertyNotSetDataMemberName")
+                .GetProperty("$ref")
+                .GetString();
+
             Assert.Equal("object", schemaType);
             JsonElement property = Assert.Single(required);
             Assert.Equal("Property", property.GetString());
             Assert.Equal("#/components/schemas/ComplexPropertyClass-ComplexPropertyInnerClass", reference);
+            Assert.Equal($"#/components/schemas/ComplexPropertyClass-{nameof(ComplexPropertyInnerClassNotSetDataContractName)}", referenceTwo);
         }
 
         [DataContract(Name = "SimpleCollectionPropertyClass")]
@@ -1370,10 +1547,16 @@ namespace CoreWCF.WebHttp.Tests
             [DataMember(Name = "Property")]
             [OpenApiProperty(Description = "description", IsRequired = true)]
             public List<InnerComplexCollectionPropertyClass> Property { get; set; }
+
+            [DataMember]
+            public List<InnerComplexCollectionPropertyClassNotSetDataContractName> PropertyNotSetDataMemberName { get; set; }
         }
 
         [DataContract(Name = "InnerComplexCollectionPropertyClass")]
         private class InnerComplexCollectionPropertyClass { }
+
+        [DataContract]
+        private class InnerComplexCollectionPropertyClassNotSetDataContractName { }
 
         private interface IComplexCollectionPropertyAdded
         {
@@ -1406,9 +1589,22 @@ namespace CoreWCF.WebHttp.Tests
                 .GetProperty("type")
                 .GetString();
 
+            string typeTwo = schema
+                .GetProperty("properties")
+                .GetProperty("PropertyNotSetDataMemberName")
+                .GetProperty("type")
+                .GetString();
+
             string itemType = schema
                 .GetProperty("properties")
                 .GetProperty("Property")
+                .GetProperty("items")
+                .GetProperty("$ref")
+                .GetString();
+
+            string itemTypeTwo = schema
+                .GetProperty("properties")
+                .GetProperty("PropertyNotSetDataMemberName")
                 .GetProperty("items")
                 .GetProperty("$ref")
                 .GetString();
@@ -1423,7 +1619,9 @@ namespace CoreWCF.WebHttp.Tests
             JsonElement property = Assert.Single(required);
             Assert.Equal("Property", property.GetString());
             Assert.Equal("array", type);
+            Assert.Equal("array", typeTwo);
             Assert.Equal("#/components/schemas/ComplexCollectionPropertyClass-Array-InnerComplexCollectionPropertyClass", itemType);
+            Assert.Equal($"#/components/schemas/ComplexCollectionPropertyClass-Array-{nameof(InnerComplexCollectionPropertyClassNotSetDataContractName)}", itemTypeTwo);
             // Assert.Equal("#/components/schemas/items/InnerComplexCollectionPropertyClass", itemType);
             Assert.Equal("description", description);
         }
@@ -1448,11 +1646,11 @@ namespace CoreWCF.WebHttp.Tests
             void Operation([OpenApiParameter(ContentTypes = new[] { "application/json" })] EnumPropertyClass body);
         }
 
+        //TODO include test case format!!!
         [Fact]
         public void EnumCollectionPropertyAdded()
         {
             JsonElement json = GetJson(new OpenApiOptions(), new List<Type> { typeof(IEnumPropertyAdded) });
-
             JsonElement schema = json
                 .GetProperty("components")
                 .GetProperty("schemas")
@@ -1487,6 +1685,12 @@ namespace CoreWCF.WebHttp.Tests
                 .GetProperty("description")
                 .GetString();
 
+            string format = schema
+                .GetProperty("properties")
+                .GetProperty("Property")
+                .GetProperty("format")
+                .GetString();
+
             Assert.Equal("object", schemaType);
             JsonElement property = Assert.Single(required);
             Assert.Equal("Property", property.GetString());
@@ -1494,6 +1698,7 @@ namespace CoreWCF.WebHttp.Tests
             Assert.Equal("One", values[0]);
             Assert.Equal("Two", values[1]);
             Assert.Equal("description", description);
+            Assert.Equal("enum", format);
         }
 
         private interface ITagsAddedToDocument
@@ -1540,6 +1745,428 @@ namespace CoreWCF.WebHttp.Tests
         public void MissingMethodNoNre()
         {
             GetJson(new OpenApiOptions(), new List<Type> { typeof(IMissingMethodNoNre) });
+        }
+
+        [DataContract]
+        private class NullablePropertyAddedClass
+        {
+            [DataMember]
+            public DateTime? Property { get; set; }
+        }
+        
+        private interface INullablePropertyAdded
+        {
+            [WebInvoke(Method = "POST", UriTemplate = "/path")]
+            void Operation([OpenApiParameter(ContentTypes = new[] { "application/json" })] NullablePropertyAddedClass body);
+        }
+
+        [DataContract]
+        private class SimpleArrayPropertyClass
+        {
+            [DataMember]
+            public string[] Property { get; set; }
+        }
+
+        private interface ISimpleArrayPropertyAdded
+        {
+            [WebInvoke(Method = "POST", UriTemplate = "/path")]
+            void Operation([OpenApiParameter(ContentTypes = new[] { "application/json" })] SimpleArrayPropertyClass body);
+        }
+
+        [Fact]
+        public void SimpleArrayPropertyAdded()
+        {
+            JsonElement json = GetJson(new OpenApiOptions(), new List<Type> { typeof(ISimpleArrayPropertyAdded) });
+
+            JsonElement schema = json
+                .GetProperty("components")
+                .GetProperty("schemas")
+                .GetProperty(typeof(SimpleArrayPropertyClass).GetFullNameSpace());
+
+            string schemaType = schema
+                .GetProperty("type")
+                .GetString();
+
+            string type = schema
+                .GetProperty("properties")
+                .GetProperty("Property")
+                .GetProperty("type")
+                .GetString();
+
+            string itemType = schema
+                .GetProperty("properties")
+                .GetProperty("Property")
+                .GetProperty("items")
+                .GetProperty("type")
+                .GetString();
+            
+            Assert.Equal("object", schemaType);
+            Assert.Equal("array", type);
+            Assert.Equal("string", itemType);
+        }
+
+        [DataContract]
+        private class ComplexArrayPropertyClass
+        {
+            [DataMember]
+            public ComplexArray[] Property { get; set; }
+        }
+
+        private class ComplexArray
+        {
+        }
+
+        private interface IComplexArrayPropertyAdded
+        {
+            [WebInvoke(Method = "POST", UriTemplate = "/path")]
+            void Operation([OpenApiParameter(ContentTypes = new[] { "application/json" })] ComplexArrayPropertyClass body);
+        }
+
+        [Fact]
+        public void ComplexArrayPropertyAdded()
+        {
+            JsonElement json = GetJson(new OpenApiOptions(), new List<Type> { typeof(IComplexArrayPropertyAdded) });
+
+            JsonElement schema = json
+                .GetProperty("components")
+                .GetProperty("schemas")
+                .GetProperty(typeof(SimpleArrayPropertyClass).GetFullNameSpace());
+
+            string schemaType = schema
+                .GetProperty("type")
+                .GetString();
+
+            string type = schema
+                .GetProperty("properties")
+                .GetProperty("Property")
+                .GetProperty("type")
+                .GetString();
+
+            string itemType = schema
+                .GetProperty("properties")
+                .GetProperty("Property")
+                .GetProperty("items")
+                .GetProperty("type")
+                .GetString();
+
+            Assert.Equal("object", schemaType);
+            Assert.Equal("array", type);
+            Assert.Equal("string", itemType);
+        }
+
+
+        [Fact]
+        public void NullablePropertyAdded()
+        {
+            JsonElement json = GetJson(new OpenApiOptions(), new List<Type> { typeof(INullablePropertyAdded) });
+            JsonElement schema = json
+                .GetProperty("components")
+                .GetProperty("schemas")
+                .GetProperty(typeof(NullablePropertyAddedClass).GetFullNameSpace());
+
+            string schemaType = schema
+                .GetProperty("type")
+                .GetString();
+
+            string type = schema
+                .GetProperty("properties")
+                .GetProperty("Property")
+                .GetProperty("type")
+                .GetString();
+
+            string format = schema
+                .GetProperty("properties")
+                .GetProperty("Property")
+                .GetProperty("format")
+                .GetString();
+
+            Assert.Equal("object", schemaType);
+            Assert.Equal("string", type);
+            Assert.Equal("date-time", format);
+        }
+
+        public interface ICustomCollection
+        {
+        }
+
+        [DataContract]
+        public class CustomMappingCollection
+        {
+            [DataMember]
+            public CustomMappingCollectionOne CustomMappingPropertyOne {get; set; }
+
+            [DataMember]
+            public CustomMappingCollectionTwo CustomMappingPropertyTwo { get; set; }
+        }
+        
+        [DataContract]
+        public class CustomMappingCollectionOne : ICustomCollection
+        {
+            public static string Example = $"{nameof(CustomMappingCollectionOne)}: Some specific thing from this class";
+        }
+
+        [DataContract]
+        public class CustomMappingCollectionTwo : ICustomCollection
+        {
+            public static string Example = $"{nameof(CustomMappingCollectionTwo)}: Some specific thing from this class";
+        }
+        
+        public interface ICustomMappingColletionsDefined
+        {
+            [WebInvoke(Method = "POST", UriTemplate = "/path")]
+            void Operation([OpenApiParameter(ContentTypes = new[] { "application/json" })] CustomMappingCollection body);
+        }
+
+        [Fact]
+        public void CustomMappingsAdded()
+        {
+            var customMapping = BuildCustomCollection();
+             JsonElement json = GetJson(new OpenApiOptions(){CustomTypeMappings = customMapping }, new List<Type> { typeof(ICustomMappingColletionsDefined) });
+           
+           var customPropertyValueType = json
+               .GetProperty("components")
+               .GetProperty("schemas")
+               .GetProperty(typeof(CustomMappingCollectionOne).GetFullNameSpace())
+               .GetProperty("properties")
+               .GetProperty("Value")
+               .GetProperty("type")
+               .GetString();
+           var expectedPropertyValueType = "number";
+
+           var customPropertyValueExample = json
+               .GetProperty("components")
+               .GetProperty("schemas")
+               .GetProperty(typeof(CustomMappingCollectionOne).GetFullNameSpace())
+               .GetProperty("properties")
+               .GetProperty("Value")
+               .GetProperty("example")
+               .GetDouble();
+           var expectedPropertyValueExample = 3.14;
+           
+           var customPropertyUnitEnumValues = json
+               .GetProperty("components")
+               .GetProperty("schemas")
+               .GetProperty(typeof(CustomMappingCollectionOne).GetFullNameSpace())
+               .GetProperty("properties")
+               .GetProperty("Unit")
+               .GetProperty("enum")
+               .EnumerateArray()
+               .Select(value => value.GetString())
+               .ToList();
+            var expectedPropertyUnitEnumValues = new List<string> { "One", "Two" };
+           
+           var customPropertyUnitTypeValue = json
+                   .GetProperty("components")
+                   .GetProperty("schemas")
+                   .GetProperty(typeof(CustomMappingCollectionOne).GetFullNameSpace())
+                   .GetProperty("properties")
+                   .GetProperty("Unit")
+                   .GetProperty("type")
+                   .GetString();
+           var expectedPropertyUnitTypeValue = "string";
+
+           var customPropertyUnitFormatValue = json
+               .GetProperty("components")
+               .GetProperty("schemas")
+               .GetProperty(typeof(CustomMappingCollectionOne).GetFullNameSpace())
+               .GetProperty("properties")
+               .GetProperty("Unit")
+                .GetProperty("format")
+                .GetString();
+           var expectedPropertyUnitFormatValue = "enum";
+
+           var customPropertyUnitExampleValue = json
+               .GetProperty("components")
+               .GetProperty("schemas")
+               .GetProperty(typeof(CustomMappingCollectionOne).GetFullNameSpace())
+               .GetProperty("properties")
+               .GetProperty("Unit")
+               .GetProperty("example")
+               .GetString();
+           var expectedPropertyUnitExampleValue = "One + Two = Three";
+
+           var customPropertyTypeTypeValue = json
+               .GetProperty("components")
+               .GetProperty("schemas")
+               .GetProperty(typeof(CustomMappingCollectionOne).GetFullNameSpace())
+               .GetProperty("properties")
+               .GetProperty("Type")
+               .GetProperty("type")
+               .GetString();
+           var expectedPropertyTypeTypeValue =  "string";
+
+           var customPropertyTypeDefaultValue = json
+               .GetProperty("components")
+               .GetProperty("schemas")
+               .GetProperty(typeof(CustomMappingCollectionOne).GetFullNameSpace())
+               .GetProperty("properties")
+               .GetProperty("Type")
+               .GetProperty("default")
+               .GetString();
+           var expectedPropertyTypeDefaultValue =
+               $"{nameof(CustomMappingCollectionOne)}";
+
+           var customPropertyDescriptionValue = json
+               .GetProperty("components")
+               .GetProperty("schemas")
+               .GetProperty(typeof(CustomMappingCollectionOne).GetFullNameSpace())
+               .GetProperty("description")
+               .GetString();
+           var expectedPropertyDescriptionValue = "This is custom mapping collection description";
+
+           var customPropertyExternalDocsDescriptionValue = json
+               .GetProperty("components")
+               .GetProperty("schemas")
+               .GetProperty(typeof(CustomMappingCollectionOne).GetFullNameSpace())
+               .GetProperty("externalDocs")
+               .GetProperty("description")
+               .GetString();
+           var expectedPropertyExternalDocsDescriptionValue = "External docs description";
+
+           var customPropertyExternalDocsUrlValue = json
+               .GetProperty("components")
+               .GetProperty("schemas")
+               .GetProperty(typeof(CustomMappingCollectionOne).GetFullNameSpace())
+               .GetProperty("externalDocs")
+               .GetProperty("url")
+               .GetString();
+           var expectedPropertyExternalDocsUrlValue = "https://github.com/CoreWCF";
+
+           var customPropertyExampleValue = json
+                   .GetProperty("components")
+                   .GetProperty("schemas")
+                   .GetProperty(typeof(CustomMappingCollectionOne).GetFullNameSpace())
+                   .GetProperty("example")
+                   .GetProperty("Value")
+                   .GetDouble();
+           var expectedPropertyExampleValue = 2.19;
+
+           var customPropertyExampleUnitValue = json
+               .GetProperty("components")
+               .GetProperty("schemas")
+               .GetProperty(typeof(CustomMappingCollectionOne).GetFullNameSpace())
+               .GetProperty("example")
+               .GetProperty("Unit")
+               .GetString();
+           var expectePropertyExampleUnitValue = "Some unit";
+
+            var customPropertyExampleTypeValue = json
+               .GetProperty("components")
+               .GetProperty("schemas")
+               .GetProperty(typeof(CustomMappingCollectionOne).GetFullNameSpace())
+               .GetProperty("example")
+               .GetProperty("Type")
+               .GetString();
+            var expectedPropertyExampleTypeValue = nameof(CustomMappingCollectionOne);
+
+            Assert.Equal(customPropertyValueType, expectedPropertyValueType);
+            Assert.Equal(customPropertyValueExample, expectedPropertyValueExample);
+            Assert.Equal(customPropertyUnitEnumValues, expectedPropertyUnitEnumValues);
+            Assert.Equal(customPropertyUnitTypeValue, expectedPropertyUnitTypeValue);
+            Assert.Equal(customPropertyUnitFormatValue, expectedPropertyUnitFormatValue);
+            Assert.Equal(customPropertyUnitExampleValue, expectedPropertyUnitExampleValue);
+            Assert.Equal(customPropertyTypeTypeValue, expectedPropertyTypeTypeValue);
+            Assert.Equal(customPropertyTypeDefaultValue, expectedPropertyTypeDefaultValue);
+            Assert.Equal(customPropertyDescriptionValue, expectedPropertyDescriptionValue);
+            Assert.Equal(customPropertyExternalDocsDescriptionValue, expectedPropertyExternalDocsDescriptionValue);
+            Assert.Equal(customPropertyExternalDocsUrlValue, expectedPropertyExternalDocsUrlValue);
+            Assert.Equal(customPropertyExampleValue, expectedPropertyExampleValue);
+            Assert.Equal(customPropertyExampleUnitValue, expectePropertyExampleUnitValue);
+            Assert.Equal(customPropertyExampleTypeValue, expectedPropertyExampleTypeValue);
+        }
+
+        private Dictionary<Type, Func<OpenApiSchema>> BuildCustomCollection()
+        {
+            var mappings = new Dictionary<Type, Func<OpenApiSchema>>();
+
+            mappings[typeof(CustomMappingCollectionOne)] = BuildOpenApiSchema(typeof(CustomMappingCollectionOne));
+            mappings[typeof(CustomMappingCollectionTwo)] = BuildOpenApiSchema(typeof(CustomMappingCollectionTwo));
+
+            mappings[typeof(ICustomCollection)] = () =>
+            {
+                var example = CustomMappingCollectionOne.Example;
+                double valueFromDerivedClass = 2.19;
+                var someValueOrContextFromDerivedClass =
+                    "CustomMappingCollectionOne/CustomMappingCollectionOne some specific default stuff desc";
+                return new OpenApiSchema()
+                {
+                    Description = someValueOrContextFromDerivedClass,
+                    ExternalDocs =
+                        new OpenApiExternalDocs()
+                        {
+                            Url = new Uri("https://github.com/CoreWCF"), Description = "github"
+                        },
+                    Type = "object",
+                    Properties = new Dictionary<string, OpenApiSchema>
+                    {
+                        {
+                            "Value",
+                            new OpenApiSchema {Type = "number", Example = new OpenApiDouble(valueFromDerivedClass)}
+                        },
+                        {   "Unit",
+                            new OpenApiSchema {Type = "enum", Example = new OpenApiString(example),}
+                        },
+                        {
+                            "Type",
+                            new OpenApiSchema
+                            {
+                                Type = "string", Default = new OpenApiString(someValueOrContextFromDerivedClass)
+                            }
+                        }
+                    }
+                };
+            };
+
+            return mappings;
+        }
+        
+        private Func<OpenApiSchema> BuildOpenApiSchema(Type type)
+        {
+            string descriptionExample = "This is custom mapping collection description";
+            List<string> list = new List<string> {"One", "Two"};
+            IList<IOpenApiAny> enumValues = list.Select(a => (IOpenApiAny) new OpenApiString(a)).ToList();
+            return () => new OpenApiSchema()
+            {
+                Type = "object",
+                Description = descriptionExample,
+                ExternalDocs =
+                    new OpenApiExternalDocs
+                    {
+                        Description = "External docs description", Url = new Uri("https://github.com/CoreWCF")
+                    },
+                Example =
+                    new OpenApiObject
+                    {
+                        ["Value"] = new OpenApiDouble(2.19),
+                        ["Unit"] = new OpenApiString("Some unit"),
+                        ["Type"] = new OpenApiString(type.Name)
+                    },
+                Properties = new Dictionary<string, OpenApiSchema>
+                {
+                    {
+                        "Value",
+                        new OpenApiSchema {Type = "number", Example = new OpenApiDouble(3.14)}
+                    },
+                    {
+                        "Unit",
+                        new OpenApiSchema
+                        {
+                            Type = "string",
+                            Format = "enum",
+                            Enum = enumValues,
+                            Example = new OpenApiString("One + Two = Three")
+                        }
+                    },
+                    {
+                        "Type",
+                        new OpenApiSchema
+                        {
+                            Type = "string",
+                            Default = new OpenApiString(type.Name)
+                        }
+                    }
+                }
+            };
         }
 
         private static JsonElement GetJson(OpenApiOptions options, IEnumerable<OpenApiContractInfo> contracts)
