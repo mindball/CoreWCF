@@ -796,7 +796,7 @@ namespace CoreWCF.OpenApi
                                 queue.Enqueue((type, actualType, isGenericList));
                             break;
                         case TypeKind.InterfaceType:
-                            ProcessInterfaceProperty(document, type, property, customTypeMappings);
+                            ProcessInterfaceProperty(document, parent, type, property, customTypeMappings);
                             break;
                         case TypeKind.None:
                             if (IsContractAndIsNewContract(type, property.PropertyType, seenKeys,
@@ -824,20 +824,24 @@ namespace CoreWCF.OpenApi
             return true;
         }
 
-        private static void ProcessInterfaceProperty(OpenApiDocument document, Type type, PropertyInfo property,
+        private static void ProcessInterfaceProperty(OpenApiDocument document, Type parent, Type type, PropertyInfo property,
             IReadOnlyDictionary<Type, Func<OpenApiSchema>> customTypeMappings)
         {
             var typeName = type.Name;
             var propertyName = property.Name;
-            var schemaKey = GetSchemaKey(null, null, property.PropertyType, false);
+            var schemaKey = GetSchemaKey(null, null, type, false);
             if (document.Components.Schemas.TryGetValue(schemaKey, out var existInterfaceSchema))
             {
-                var underlyingTypes = type.GetCustomAttributes<KnownTypeAttribute>().ToList();
+                //i wanto to obtain on property get type and set attributes
+                var propertyType = property.PropertyType;
+                var propertyAttributes = type.GetCustomAttributes<KnownTypeAttribute>().ToList();
+
+                var underlyingTypes = property.GetCustomAttributes<KnownTypeAttribute>().ToList();
                 var knownTypesSchemas = new List<OpenApiSchema>();
 
-                foreach (var knownTypeAttribute in underlyingTypes)
+                foreach (var knownTypeAttribute in propertyAttributes)
                     if (knownTypeAttribute.Type != null &&
-                        customTypeMappings.TryGetValue(knownTypeAttribute.Type, out var customTypeSchema))
+                        customTypeMappings.TryGetValue(propertyType, out var customTypeSchema))
                         knownTypesSchemas.Add(customTypeSchema());
 
                 existInterfaceSchema.Properties.Add(property.Name,

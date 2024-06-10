@@ -18,6 +18,7 @@ using CoreWCF.Web;
 using Microsoft.OpenApi.Any;
 using Microsoft.OpenApi.Models;
 using Microsoft.OpenApi.Writers;
+using Microsoft.VisualBasic;
 using Xunit;
 
 namespace CoreWCF.WebHttp.Tests
@@ -1812,6 +1813,7 @@ namespace CoreWCF.WebHttp.Tests
             public ComplexArray[] Property { get; set; }
         }
 
+        [DataContract]
         private class ComplexArray
         {
         }
@@ -1829,29 +1831,26 @@ namespace CoreWCF.WebHttp.Tests
 
             JsonElement schema = json
                 .GetProperty("components")
-                .GetProperty("schemas")
-                .GetProperty(typeof(SimpleArrayPropertyClass).GetFullNameSpace());
+                .GetProperty("schemas");
+                
 
             string schemaType = schema
-                .GetProperty("type")
-                .GetString();
-
-            string type = schema
+                .GetProperty(typeof(ComplexArrayPropertyClass).GetFullNameSpace())
                 .GetProperty("properties")
                 .GetProperty("Property")
                 .GetProperty("type")
                 .GetString();
 
-            string itemType = schema
+            string schemaItems = schema
+                .GetProperty(typeof(ComplexArrayPropertyClass).GetFullNameSpace())
                 .GetProperty("properties")
                 .GetProperty("Property")
                 .GetProperty("items")
-                .GetProperty("type")
+                .GetProperty("$ref")
                 .GetString();
 
-            Assert.Equal("object", schemaType);
-            Assert.Equal("array", type);
-            Assert.Equal("string", itemType);
+            Assert.Equal("array", schemaType);
+            Assert.Equal($"#/components/schemas/{typeof(ComplexArray).GetFullNameSpace()}", schemaItems);
         }
 
 
@@ -1885,34 +1884,45 @@ namespace CoreWCF.WebHttp.Tests
             Assert.Equal("date-time", format);
         }
 
-        public interface ICustomCollection
-        {
-        }
-
+        
         [DataContract]
+        [KnownType(typeof(CustomMappingCollectionTwoKnowTypeDefinedOne))]
+        [KnownType(typeof(CustomMappingCollectionTwoKnowTypeDefinedTwo))]
         public class CustomMappingCollection
         {
             [DataMember]
             public CustomMappingCollectionOne CustomMappingPropertyOne {get; set; }
 
             [DataMember]
-            public CustomMappingCollectionTwo CustomMappingPropertyTwo { get; set; }
+            public ICustomMappingCollectionDefinedKnowTypes CustomMappingPropertyKnowTypesDefined { get; set; }
         }
         
         [DataContract]
-        public class CustomMappingCollectionOne : ICustomCollection
+        public class CustomMappingCollectionOne
         {
             public static string Example = $"{nameof(CustomMappingCollectionOne)}: Some specific thing from this class";
         }
 
-        [DataContract]
-        public class CustomMappingCollectionTwo : ICustomCollection
+        public interface ICustomMappingCollectionDefinedKnowTypes
         {
-            public static string Example = $"{nameof(CustomMappingCollectionTwo)}: Some specific thing from this class";
         }
-        
-        public interface ICustomMappingColletionsDefined
+
+        [DataContract]
+        public class CustomMappingCollectionTwoKnowTypeDefinedOne : ICustomMappingCollectionDefinedKnowTypes
         {
+        }
+
+        [DataContract]
+        public class CustomMappingCollectionTwoKnowTypeDefinedTwo : ICustomMappingCollectionDefinedKnowTypes
+        {
+        }
+
+
+        public interface ICustomMappingCollectionsDefined
+        {
+            [WebInvoke(Method = "POST", UriTemplate = "/path")]
+            void Operation([OpenApiParameter(ContentTypes = new[] { "application/json" })] CustomMappingCollectionOne body);
+
             [WebInvoke(Method = "POST", UriTemplate = "/path")]
             void Operation([OpenApiParameter(ContentTypes = new[] { "application/json" })] CustomMappingCollection body);
         }
@@ -1921,7 +1931,7 @@ namespace CoreWCF.WebHttp.Tests
         public void CustomMappingsAdded()
         {
             var customMapping = BuildCustomCollection();
-             JsonElement json = GetJson(new OpenApiOptions(){CustomTypeMappings = customMapping }, new List<Type> { typeof(ICustomMappingColletionsDefined) });
+             JsonElement json = GetJson(new OpenApiOptions(){CustomTypeMappings = customMapping }, new List<Type> { typeof(ICustomMappingCollectionsDefined) });
            
            var customPropertyValueType = json
                .GetProperty("components")
@@ -2075,14 +2085,91 @@ namespace CoreWCF.WebHttp.Tests
             Assert.Equal(customPropertyExampleTypeValue, expectedPropertyExampleTypeValue);
         }
 
-        private Dictionary<Type, Func<OpenApiSchema>> BuildCustomCollection()
+
+        [Fact]
+        public void CustomMappingsKnowTypesDefinedAdded()
+        {
+            var customMapping = BuildCustomCollection(true);
+            JsonElement json = GetJson(new OpenApiOptions() { CustomTypeMappings = customMapping }, new List<Type> { typeof(ICustomMappingCollectionsDefined) });
+            var j = json.ToString();
+            var customPropertyOneOfSize = json
+                .GetProperty("components")
+                .GetProperty("schemas")
+                .GetProperty(typeof(CustomMappingCollection).GetFullNameSpace())
+                .GetProperty("properties")
+                .GetProperty("CustomMappingPropertyKnowTypesDefined")
+                .GetProperty("oneOf").GetArrayLength();
+
+            var customPropertyOneOfArrayData = json
+                .GetProperty("components")
+                .GetProperty("schemas")
+                .GetProperty(typeof(CustomMappingCollection).GetFullNameSpace())
+                .GetProperty("properties")
+                .GetProperty("CustomMappingPropertyKnowTypesDefined")
+                .GetProperty("oneOf").EnumerateArray().ToList();
+
+            
+            foreach (var oneOfType in customPropertyOneOfArrayData)
+            {
+                var oneofTypeValue =
+                    oneOfType.GetProperty("type")
+                    .GetString();
+
+                var oneOfTypePropertiesValuePropertyType = oneOfType.GetProperty("properties")
+                    .GetProperty("Value").GetProperty("type").GetString();
+
+                var oneOfTypePropertiesValuePropertyExample = oneOfType.GetProperty("properties")
+                    .GetProperty("Value").GetProperty("example").GetDouble();
+
+                var oneOfTypePropertiesUnitPropertyType = oneOfType.GetProperty("properties")
+                    .GetProperty("Unit").GetProperty("type").GetString();
+
+                var oneOfTypePropertiesUnitPropertyExample = oneOfType.GetProperty("properties")
+                    .GetProperty("Unit").GetProperty("example").GetString();
+
+                var oneOfTypePropertiesTypePropertyType = oneOfType.GetProperty("properties")
+                    .GetProperty("Type").GetProperty("type").GetString();
+
+                var oneOfTypePropertiesTypePropertyDefault = oneOfType.GetProperty("properties")
+                    .GetProperty("Type").GetProperty("default").GetString();
+
+                var oneofTypeDescriptionValue =
+                    oneOfType.GetProperty("description")
+                        .GetString();
+
+                var oneofTypeExternalDocsDescriptionValue =
+                    oneOfType.GetProperty("externalDocs")
+                        .GetProperty("description").GetString();
+                var oneofTypeExternalDocsUrlValue =
+                    oneOfType.GetProperty("externalDocs")
+                        .GetProperty("url").GetString();
+
+                Assert.Equal("object", oneofTypeValue);
+                Assert.Equal("number", oneOfTypePropertiesValuePropertyType);
+                Assert.Equal(2.19, oneOfTypePropertiesValuePropertyExample);
+                Assert.Equal("enum", oneOfTypePropertiesUnitPropertyType);
+                Assert.Equal("CustomMappingCollectionOne: Some specific thing from this class", oneOfTypePropertiesUnitPropertyExample);
+                Assert.Equal("string", oneOfTypePropertiesTypePropertyType);
+                Assert.Equal("CustomMappingCollectionOne/CustomMappingCollectionOne some specific default stuff desc",
+                    oneOfTypePropertiesTypePropertyDefault);
+
+                Assert.Equal("CustomMappingCollectionOne/CustomMappingCollectionOne some specific default stuff desc", oneofTypeDescriptionValue);
+
+                Assert.Equal("github", oneofTypeExternalDocsDescriptionValue);
+                Assert.Equal("https://github.com/CoreWCF", oneofTypeExternalDocsUrlValue);
+            }
+
+
+        }
+
+        private Dictionary<Type, Func<OpenApiSchema>> BuildCustomCollection(bool includeKnownTypesFeature = false)
         {
             var mappings = new Dictionary<Type, Func<OpenApiSchema>>();
 
             mappings[typeof(CustomMappingCollectionOne)] = BuildOpenApiSchema(typeof(CustomMappingCollectionOne));
-            mappings[typeof(CustomMappingCollectionTwo)] = BuildOpenApiSchema(typeof(CustomMappingCollectionTwo));
 
-            mappings[typeof(ICustomCollection)] = () =>
+            if(includeKnownTypesFeature)
+                mappings[typeof(ICustomMappingCollectionDefinedKnowTypes)] = () =>
             {
                 var example = CustomMappingCollectionOne.Example;
                 double valueFromDerivedClass = 2.19;
